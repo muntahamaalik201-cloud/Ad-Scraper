@@ -5,7 +5,7 @@
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 import difflib
 import re
 
@@ -846,14 +846,14 @@ def get_best_matching_package(headline, description, package_list, min_score=MIN
 def decode_all(text):
     """Decode every encoding variant so no package name is missed."""
     text = re.sub(r'\\x3[Dd]', '=', text)
-    text = re.sub(r'\\x26',    '&', text)
+    text = re.sub(r'\\x26',   '&', text)
     text = re.sub(r'\\x3[Ff]', '?', text)
     text = re.sub(r'\\x2[Ff]', '/', text)
     text = re.sub(r'\\u003[Dd]', '=', text)
-    text = re.sub(r'\\u0026',    '&', text)
+    text = re.sub(r'\\u0026',   '&', text)
     text = re.sub(r'\\u003[Ff]', '?', text)
     text = re.sub(r'%3[Dd]', '=', text, flags=re.I)
-    text = re.sub(r'%26',    '&', text, flags=re.I)
+    text = re.sub(r'%26',   '&', text, flags=re.I)
     text = re.sub(r'%3[Ff]', '?', text, flags=re.I)
     text = re.sub(r'%2[Ff]', '/', text, flags=re.I)
     text = re.sub(r'%3[Aa]', ':', text, flags=re.I)
@@ -1230,9 +1230,6 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
-# =========================
-# MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
-# =========================
 
 def is_valid_text_ad(headline, description):
     if headline and headline != "N/A" and len(clean_text(headline)) >= 3:
@@ -1297,6 +1294,54 @@ def has_visible_image_creative(page):
 
     return False
 
+# =========================
+# DATE FILTER LOGIC
+# =========================
+
+def is_ad_recent_enough(page, max_days=90):
+    """
+    Checks if the ad was shown within the last X days.
+    We explicitly ignore the format label in the DOM as it is often inaccurate,
+    and rely purely on regex to extract the date string itself.
+    """
+    js = r"""
+    () => {
+        const elements = document.querySelectorAll('*');
+        for (let el of elements) {
+            if (el.childElementCount > 0) continue;
+            let text = el.innerText || "";
+            if (text.includes("Last shown:")) {
+                return text;
+            }
+        }
+        return null;
+    }
+    """
+    try:
+        raw_text = page.evaluate(js)
+        if not raw_text:
+            for frame in page.frames:
+                raw_text = frame.evaluate(js)
+                if raw_text: break
+        
+        if not raw_text:
+            return True
+
+        # Extract only the date matching the pattern (e.g. "Apr 24, 2026")
+        match = re.search(r"([A-Z][a-z]{2}\s\d{1,2},\s\d{4})", raw_text)
+        if match:
+            clean_date = match.group(1)
+            ad_date = datetime.strptime(clean_date, "%b %d, %Y")
+            cutoff_date = datetime.now() - timedelta(days=max_days)
+            return ad_date >= cutoff_date
+    except Exception as e:
+        print(f"Date extraction error: {e}")
+        
+    return True
+
+# =========================
+# MAIN SCRAPING EXECUTION
+# =========================
 
 def scrape_single_url(url_row):
     row_num, url = url_row
@@ -1360,6 +1405,38 @@ def scrape_single_url(url_row):
             page.wait_for_timeout(4000)
 
             advertiser = extract_advertiser_from_page(page)
+
+            # =========================
+            # CHECK DATE BEFORE EXTRACTION
+            # =========================
+            if not is_ad_recent_enough(page, max_days=90):
+                print(f"⏳ Row {row_num}: Ad is older than 3 months. Skipping extraction.")
+                process_time = get_exact_time()
+                
+                data = [
+                    advertiser,
+                    "N/A", # package_name
+                    url,
+                    "N/A", # app_link
+                    process_time,
+                    "N/A", # video_id/ad_type
+                    process_time
+                ]
+                
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, "N/A", "N/A")
+                
+                safe_add_log(
+                    row_number=row_num,
+                    status="SKIPPED_OLD_AD",
+                    log_type="COMBINED",
+                    url=url,
+                    video_id="N/A",
+                    app_link="N/A",
+                    message="Ad is older than 3 months, skipped extraction."
+                )
+                return
+            # =========================
 
             # VIDEO LOGIC: same original flow. No text/image extraction runs before this.
             video_id = detect_video_id(page, captured)
