@@ -103,7 +103,8 @@ def clean_text(value):
 # OLD AD SKIP LOGIC
 # =========================
 
-OLD_AD_MONTHS = 3
+OLD_AD_MONTHS = 2
+FAST_DATE_CHECK_TIMEOUT_SECONDS = 8
 
 
 def subtract_months(dt, months):
@@ -165,6 +166,10 @@ def parse_transparency_date(date_text):
 
 
 def collect_visible_page_text(page):
+    """
+    Fast visible text reader for the date pre-check.
+    No long Playwright waits here.
+    """
     texts = []
 
     try:
@@ -185,28 +190,71 @@ def collect_visible_page_text(page):
     return "\n".join(texts)
 
 
-def extract_last_shown_date(page):
+def extract_last_shown_date_from_text(text):
     """
-    Reads the visible Last shown / Last served date from the Google Ads Transparency page.
-    This is checked before video/text/image extraction starts.
+    Extracts Last shown / Last served date from already-collected page text.
+    Handles normal lines and line-break formats like:
+    Last shown\nMay 12, 2026
     """
-    text = collect_visible_page_text(page)
+    if not text:
+        return None
 
-    patterns = [
-        r"Last\s+shown\s*:?-?\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
-        r"Last\s+shown\s*:?-?\s*(?:on\s*)?(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
-        r"Last\s+shown\s*:?-?\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{4})",
-        r"Last\s+served\s*:?-?\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
-        r"Last\s+served\s*:?-?\s*(?:on\s*)?(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
-        r"Last\s+served\s*:?-?\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{4})",
+    normalized = re.sub(r"\s+", " ", str(text))
+
+    # Strong match: date close to Last shown / Last served.
+    close_patterns = [
+        r"(?:Last\s+shown|Last\s+served)[^A-Za-z0-9]{0,40}([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
+        r"(?:Last\s+shown|Last\s+served)[^A-Za-z0-9]{0,40}(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
+        r"(?:Last\s+shown|Last\s+served)[^A-Za-z0-9]{0,40}([A-Za-z]{3,9}\s+\d{4})",
     ]
 
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+    for pattern in close_patterns:
+        match = re.search(pattern, normalized, re.IGNORECASE)
         if match:
             parsed = parse_transparency_date(match.group(1))
             if parsed:
                 return parsed
+
+    # Fallback: inspect a short window after the words "Last shown" / "Last served".
+    marker = re.search(r"(?:Last\s+shown|Last\s+served)", normalized, re.IGNORECASE)
+    if marker:
+        window = normalized[marker.end(): marker.end() + 250]
+        date_candidates = re.findall(
+            r"[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{4}",
+            window,
+            flags=re.IGNORECASE
+        )
+        for candidate in date_candidates:
+            parsed = parse_transparency_date(candidate)
+            if parsed:
+                return parsed
+
+    return None
+
+
+def extract_last_shown_date(page):
+    """
+    Reads the visible Last shown / Last served date from the Google Ads Transparency page.
+    """
+    return extract_last_shown_date_from_text(collect_visible_page_text(page))
+
+
+def wait_for_last_shown_date_fast(page, max_seconds=FAST_DATE_CHECK_TIMEOUT_SECONDS):
+    """
+    Fast polling only for the date text.
+    It does NOT wait for video, install link, advertiser, images, or networkidle.
+    """
+    start = time.time()
+
+    while time.time() - start < max_seconds:
+        last_shown_date = extract_last_shown_date(page)
+        if last_shown_date:
+            return last_shown_date
+
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            time.sleep(0.5)
 
     return None
 
@@ -214,11 +262,11 @@ def extract_last_shown_date(page):
 def is_ad_older_than_months(page, months=OLD_AD_MONTHS):
     """
     Returns:
-    True, date  -> old ad, skip extraction
+    True, date  -> old ad, skip extraction immediately
     False, date -> fresh ad, continue extraction
     False, N/A  -> date not found, continue extraction safely
     """
-    last_shown_date = extract_last_shown_date(page)
+    last_shown_date = wait_for_last_shown_date_fast(page, max_seconds=FAST_DATE_CHECK_TIMEOUT_SECONDS)
 
     if not last_shown_date:
         return False, "N/A"
@@ -230,6 +278,23 @@ def is_ad_older_than_months(page, months=OLD_AD_MONTHS):
 
     return False, last_shown_date.strftime("%Y-%m-%d")
 
+
+def block_heavy_resources_for_date_check(route):
+    """
+    Speeds up the initial date check.
+    Old ads do not need images/videos/fonts, so block them before the first page load.
+    Fresh ads are reloaded normally after this check.
+    """
+    try:
+        if route.request.resource_type in ("image", "media", "font"):
+            route.abort()
+        else:
+            route.continue_()
+    except Exception:
+        try:
+            route.continue_()
+        except Exception:
+            pass
 
 def extract_package_name(app_link):
     """
@@ -1489,12 +1554,14 @@ def scrape_single_url(url_row):
                 message="Started combined video/text/image ad extraction"
             )
 
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4000)
+            # =========================
+            # FAST OLD AD DATE CHECK FIRST
+            # =========================
+            # Load a light version of the page only to read the visible Last shown date.
+            # Images/videos/fonts are blocked here so old rows skip quickly.
+            page.route("**/*", block_heavy_resources_for_date_check)
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
-            # =========================
-            # OLD AD SKIP CHECK
-            # =========================
             is_old_ad, last_shown_date = is_ad_older_than_months(page, months=OLD_AD_MONTHS)
 
             if is_old_ad:
@@ -1520,11 +1587,21 @@ def scrape_single_url(url_row):
                     url=url,
                     video_id="N/A",
                     app_link="N/A",
-                    message=f"Skipped extraction because Last shown date {last_shown_date} is older than {OLD_AD_MONTHS} months"
+                    message=f"Skipped whole row because Last shown date {last_shown_date} is older than {OLD_AD_MONTHS} months"
                 )
 
-                print(f"⏭ Row {row_num}: skipped old ad | Last shown: {last_shown_date}")
+                print(f"⏭ Row {row_num}: skipped whole old row fast | Last shown: {last_shown_date}")
                 return
+
+            # Date is fresh or not found. Now reload normally and run your original extraction flow.
+            try:
+                page.unroute("**/*", block_heavy_resources_for_date_check)
+            except Exception:
+                pass
+
+            print(f"✅ Row {row_num}: date check passed | Last shown: {last_shown_date}")
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4000)
 
             advertiser = extract_advertiser_from_page(page)
 
