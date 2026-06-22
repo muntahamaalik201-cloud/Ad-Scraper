@@ -5,7 +5,8 @@
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime
+import calendar
 import difflib
 import re
 
@@ -96,6 +97,138 @@ def clean_text(value):
     if not value:
         return "N/A"
     return re.sub(r"\s+", " ", str(value)).strip() or "N/A"
+
+
+# =========================
+# OLD AD SKIP LOGIC
+# =========================
+
+OLD_AD_MONTHS = 3
+
+
+def subtract_months(dt, months):
+    """
+    Calendar-month cutoff.
+    Example: if today is 22 June, 3 months old cutoff = 22 March.
+    """
+    year = dt.year
+    month = dt.month - months
+
+    while month <= 0:
+        month += 12
+        year -= 1
+
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def parse_transparency_date(date_text):
+    """
+    Parses common Google Ads Transparency date formats.
+    Examples:
+    Jun 20, 2026
+    June 20, 2026
+    20 Jun 2026
+    20 June 2026
+    Jun 2026
+    June 2026
+    """
+    if not date_text:
+        return None
+
+    date_text = re.sub(r"\s+", " ", str(date_text).strip())
+
+    formats = [
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%d %b %Y",
+        "%d %B %Y",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_text, fmt)
+        except Exception:
+            pass
+
+    # Month + year only, example: June 2026.
+    # Treat this as the last day of that month so it is not skipped too early.
+    for fmt in ["%b %Y", "%B %Y"]:
+        try:
+            parsed = datetime.strptime(date_text, fmt)
+            last_day = calendar.monthrange(parsed.year, parsed.month)[1]
+            return parsed.replace(day=last_day)
+        except Exception:
+            pass
+
+    return None
+
+
+def collect_visible_page_text(page):
+    texts = []
+
+    try:
+        main_text = page.evaluate("() => document.body ? document.body.innerText : ''")
+        if main_text:
+            texts.append(main_text)
+    except Exception:
+        pass
+
+    for frame in page.frames:
+        try:
+            frame_text = frame.evaluate("() => document.body ? document.body.innerText : ''")
+            if frame_text:
+                texts.append(frame_text)
+        except Exception:
+            continue
+
+    return "\n".join(texts)
+
+
+def extract_last_shown_date(page):
+    """
+    Reads the visible Last shown / Last served date from the Google Ads Transparency page.
+    This is checked before video/text/image extraction starts.
+    """
+    text = collect_visible_page_text(page)
+
+    patterns = [
+        r"Last\s+shown\s*:?-?\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
+        r"Last\s+shown\s*:?-?\s*(?:on\s*)?(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
+        r"Last\s+shown\s*:?-?\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{4})",
+        r"Last\s+served\s*:?-?\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
+        r"Last\s+served\s*:?-?\s*(?:on\s*)?(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
+        r"Last\s+served\s*:?-?\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{4})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            parsed = parse_transparency_date(match.group(1))
+            if parsed:
+                return parsed
+
+    return None
+
+
+def is_ad_older_than_months(page, months=OLD_AD_MONTHS):
+    """
+    Returns:
+    True, date  -> old ad, skip extraction
+    False, date -> fresh ad, continue extraction
+    False, N/A  -> date not found, continue extraction safely
+    """
+    last_shown_date = extract_last_shown_date(page)
+
+    if not last_shown_date:
+        return False, "N/A"
+
+    cutoff_date = subtract_months(datetime.now(), months)
+
+    if last_shown_date.date() < cutoff_date.date():
+        return True, last_shown_date.strftime("%Y-%m-%d")
+
+    return False, last_shown_date.strftime("%Y-%m-%d")
 
 
 def extract_package_name(app_link):
@@ -846,14 +979,14 @@ def get_best_matching_package(headline, description, package_list, min_score=MIN
 def decode_all(text):
     """Decode every encoding variant so no package name is missed."""
     text = re.sub(r'\\x3[Dd]', '=', text)
-    text = re.sub(r'\\x26',   '&', text)
+    text = re.sub(r'\\x26',    '&', text)
     text = re.sub(r'\\x3[Ff]', '?', text)
     text = re.sub(r'\\x2[Ff]', '/', text)
     text = re.sub(r'\\u003[Dd]', '=', text)
-    text = re.sub(r'\\u0026',   '&', text)
+    text = re.sub(r'\\u0026',    '&', text)
     text = re.sub(r'\\u003[Ff]', '?', text)
     text = re.sub(r'%3[Dd]', '=', text, flags=re.I)
-    text = re.sub(r'%26',   '&', text, flags=re.I)
+    text = re.sub(r'%26',    '&', text, flags=re.I)
     text = re.sub(r'%3[Ff]', '?', text, flags=re.I)
     text = re.sub(r'%2[Ff]', '/', text, flags=re.I)
     text = re.sub(r'%3[Aa]', ':', text, flags=re.I)
@@ -1230,6 +1363,9 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
+# =========================
+# MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
+# =========================
 
 def is_valid_text_ad(headline, description):
     if headline and headline != "N/A" and len(clean_text(headline)) >= 3:
@@ -1294,54 +1430,6 @@ def has_visible_image_creative(page):
 
     return False
 
-# =========================
-# DATE FILTER LOGIC
-# =========================
-
-def is_ad_recent_enough(page, max_days=90):
-    """
-    Checks if the ad was shown within the last X days.
-    We explicitly ignore the format label in the DOM as it is often inaccurate,
-    and rely purely on regex to extract the date string itself.
-    """
-    js = r"""
-    () => {
-        const elements = document.querySelectorAll('*');
-        for (let el of elements) {
-            if (el.childElementCount > 0) continue;
-            let text = el.innerText || "";
-            if (text.includes("Last shown:")) {
-                return text;
-            }
-        }
-        return null;
-    }
-    """
-    try:
-        raw_text = page.evaluate(js)
-        if not raw_text:
-            for frame in page.frames:
-                raw_text = frame.evaluate(js)
-                if raw_text: break
-        
-        if not raw_text:
-            return True
-
-        # Extract only the date matching the pattern (e.g. "Apr 24, 2026")
-        match = re.search(r"([A-Z][a-z]{2}\s\d{1,2},\s\d{4})", raw_text)
-        if match:
-            clean_date = match.group(1)
-            ad_date = datetime.strptime(clean_date, "%b %d, %Y")
-            cutoff_date = datetime.now() - timedelta(days=max_days)
-            return ad_date >= cutoff_date
-    except Exception as e:
-        print(f"Date extraction error: {e}")
-        
-    return True
-
-# =========================
-# MAIN SCRAPING EXECUTION
-# =========================
 
 def scrape_single_url(url_row):
     row_num, url = url_row
@@ -1404,39 +1492,41 @@ def scrape_single_url(url_row):
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(4000)
 
-            advertiser = extract_advertiser_from_page(page)
+            # =========================
+            # OLD AD SKIP CHECK
+            # =========================
+            is_old_ad, last_shown_date = is_ad_older_than_months(page, months=OLD_AD_MONTHS)
 
-            # =========================
-            # CHECK DATE BEFORE EXTRACTION
-            # =========================
-            if not is_ad_recent_enough(page, max_days=90):
-                print(f"⏳ Row {row_num}: Ad is older than 3 months. Skipping extraction.")
-                process_time = get_exact_time()
-                
+            if is_old_ad:
+                skip_time = get_exact_time()
+
                 data = [
-                    advertiser,
-                    "N/A", # package_name
-                    url,
-                    "N/A", # app_link
-                    process_time,
-                    "N/A", # video_id/ad_type
-                    process_time
+                    "N/A",       # Advertiser
+                    "N/A",       # Package
+                    url,         # Transparency URL still saved
+                    "N/A",       # App link
+                    skip_time,
+                    "N/A",       # Column F: video ID / text / image
+                    skip_time
                 ]
-                
+
                 safe_update_combined_row(row_num, data)
                 safe_update_headline_desc(row_num, "N/A", "N/A")
-                
+
                 safe_add_log(
                     row_number=row_num,
-                    status="SKIPPED_OLD_AD",
+                    status="OLD_AD_SKIPPED",
                     log_type="COMBINED",
                     url=url,
                     video_id="N/A",
                     app_link="N/A",
-                    message="Ad is older than 3 months, skipped extraction."
+                    message=f"Skipped extraction because Last shown date {last_shown_date} is older than {OLD_AD_MONTHS} months"
                 )
+
+                print(f"⏭ Row {row_num}: skipped old ad | Last shown: {last_shown_date}")
                 return
-            # =========================
+
+            advertiser = extract_advertiser_from_page(page)
 
             # VIDEO LOGIC: same original flow. No text/image extraction runs before this.
             video_id = detect_video_id(page, captured)
