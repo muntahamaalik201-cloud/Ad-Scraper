@@ -148,7 +148,7 @@ def is_claim_expired(claim_time_text):
 
 
 # ==========================
-# CORE TASK PICKER (FIXED)
+# CORE TASK PICKER (FIXED WITH WRITE RETRY)
 # ==========================
 def get_next_agent_task(direction, agent_name, run_id):
     direction = direction.lower().strip()
@@ -187,11 +187,25 @@ def get_next_agent_task(direction, agent_name, run_id):
         token = f"{agent_name}-{run_id}-{uuid.uuid4().hex[:10]}"
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # SINGLE WRITE ONLY (claim row)
-        sheet.update(
-            f"I{row_num}:L{row_num}",
-            [[agent_name, now, token, "CLAIMED"]]
-        )
+        # SINGLE WRITE ONLY (claim row) WITH RETRY LOGIC
+        for attempt in range(5):
+            try:
+                sheet.update(
+                    f"I{row_num}:L{row_num}",
+                    [[agent_name, now, token, "CLAIMED"]]
+                )
+                break  # Success - exit retry loop
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e):
+                    wait = 2 * (attempt + 1)
+                    print(f"⚠ 429 hit on claim write, retrying in {wait}s")
+                    time.sleep(wait)
+                else:
+                    raise
+        else:
+            # Failed after all retries - skip this row and try next
+            print(f"❌ Failed to claim row {row_num} after retries")
+            continue
 
         # ❌ REMOVED: confirm read (major quota fix)
         # We trust write success instead of re-reading sheet
@@ -202,33 +216,55 @@ def get_next_agent_task(direction, agent_name, run_id):
 
 
 # ==========================
-# SIMPLE STATUS UPDATE
+# SIMPLE STATUS UPDATE WITH RETRY
 # ==========================
 def mark_agent_done(row_num, agent_name=None):
     sheet = get_sheet()
-    try:
-        sheet.update_cell(row_num, CLAIM_STATUS_COL, "DONE")
-    except:
-        pass
+    for attempt in range(3):
+        try:
+            sheet.update_cell(row_num, CLAIM_STATUS_COL, "DONE")
+            return
+        except gspread.exceptions.APIError as e:
+            if "429" in str(e) and attempt < 2:
+                wait = 2 * (attempt + 1)
+                print(f"⚠ 429 hit on mark_done, retrying in {wait}s")
+                time.sleep(wait)
+            else:
+                print(f"❌ Failed to mark row {row_num} as DONE: {e}")
+                return
 
 
 # ==========================
-# BULK UPDATE HELPERS
+# BULK UPDATE HELPERS WITH RETRY
 # ==========================
 def update_combined_row(row_index, data):
     sheet = get_sheet()
-    try:
-        sheet.update(f"A{row_index}:G{row_index}", [data])
-    except Exception as e:
-        print(f"Update error: {e}")
+    for attempt in range(3):
+        try:
+            sheet.update(f"A{row_index}:G{row_index}", [data])
+            return
+        except gspread.exceptions.APIError as e:
+            if "429" in str(e) and attempt < 2:
+                wait = 2 * (attempt + 1)
+                time.sleep(wait)
+            else:
+                print(f"Update error: {e}")
+                return
 
 
 def update_headline_and_description(row_index, headline, description):
     sheet = get_sheet()
-    try:
-        sheet.update(f"M{row_index}:N{row_index}", [[headline, description]])
-    except Exception as e:
-        print(f"Update error: {e}")
+    for attempt in range(3):
+        try:
+            sheet.update(f"M{row_index}:N{row_index}", [[headline, description]])
+            return
+        except gspread.exceptions.APIError as e:
+            if "429" in str(e) and attempt < 2:
+                wait = 2 * (attempt + 1)
+                time.sleep(wait)
+            else:
+                print(f"Update error: {e}")
+                return
 
 
 # ==========================
