@@ -49,7 +49,7 @@ TRANSIENT_HTTP_STATUSES = {403, 429, 500, 502, 503, 504}
 NAVIGATION_MAX_ATTEMPTS = 4
 NAVIGATION_BACKOFF_SECONDS = (3, 7, 15, 30)
 CREATIVE_CLASSIFY_TIMEOUT_SECONDS = 8
-IMAGE_TEXT_GRACE_SECONDS = 2.5
+IMAGE_TEXT_GRACE_SECONDS = 2.0
 AMBIGUOUS_VIDEO_DETECTION_SECONDS = 8
 VIDEO_PROBE_BEFORE_IMAGE_SECONDS = 5
 PLAYWRIGHT_ACTION_TIMEOUT_MS = 4000
@@ -1404,11 +1404,17 @@ def get_ranked_non_video_targets(page):
 
 def extract_text_ad_details_once(page):
     """
-    One fast text-ad probe.
+    Strict text-ad probe.
 
-    It checks the active creative frames first and combines the selector logic
-    from the previous working scraper. A large image/logo by itself never makes
-    a row a text ad; visible headline/description text is required.
+    A row is considered a text ad only when the active creative contains the
+    same explicit text-ad structures used by the previous working scraper.
+    Generic ``headline``/``description`` class matches are intentionally not
+    used because static image creatives can contain those words in wrappers,
+    metadata, accessibility nodes, or stale template frames.
+
+    A dominant raster/canvas/background creative suppresses text detection, so
+    text printed inside an image banner does not turn that image ad into a text
+    ad.
     """
     js = r"""
     () => {
@@ -1429,57 +1435,119 @@ def extract_text_ad_details_once(page):
 
         const bad = (text) => {
             const t = clean(text).toLowerCase();
-            if (!t || t.length < 2 || t.includes('{{')) return true;
+            if (!t || t.length < 2 || t.includes('{{') || t.includes('}}')) {
+                return true;
+            }
             return [
                 'ads transparency center', 'ads transparency centre',
-                'see more ads', 'report this ad', 'sign in', 'last shown'
+                'see more ads', 'report this ad', 'sign in', 'last shown',
+                'about this ad', 'why this ad', 'ad details'
             ].some(x => t === x || t.startsWith(x));
         };
+
+        const viewportWidth = Math.max(
+            document.documentElement ? document.documentElement.clientWidth : 0,
+            window.innerWidth || 0
+        );
+        const viewportHeight = Math.max(
+            document.documentElement ? document.documentElement.clientHeight : 0,
+            window.innerHeight || 0
+        );
+        const viewportArea = Math.max(viewportWidth * viewportHeight, 1);
+
+        // Static image ads normally contain one visual that occupies most of
+        // the creative frame. Small app icons/logos do not trigger this.
+        let dominantImage = false;
+
+        for (const el of document.querySelectorAll('img, picture, canvas')) {
+            if (!visible(el)) continue;
+            const rect = el.getBoundingClientRect();
+            const src = String(el.getAttribute('src') || '').toLowerCase();
+            const alt = String(el.getAttribute('alt') || '').toLowerCase();
+            if (src.includes('googlelogo') || alt.includes('google')) continue;
+
+            const coverage = (rect.width * rect.height) / viewportArea;
+            if (
+                rect.width >= 180 && rect.height >= 90 &&
+                (coverage >= 0.45 || (rect.width * rect.height) >= 90000)
+            ) {
+                dominantImage = true;
+                break;
+            }
+        }
+
+        if (!dominantImage) {
+            for (const el of document.querySelectorAll('div, a, section')) {
+                if (!visible(el)) continue;
+                const rect = el.getBoundingClientRect();
+                const bg = window.getComputedStyle(el).backgroundImage || '';
+                if (!bg || bg === 'none' || !bg.includes('url(')) continue;
+                if (bg.toLowerCase().includes('googlelogo')) continue;
+
+                const coverage = (rect.width * rect.height) / viewportArea;
+                if (
+                    rect.width >= 180 && rect.height >= 90 &&
+                    (coverage >= 0.45 || (rect.width * rect.height) >= 90000)
+                ) {
+                    dominantImage = true;
+                    break;
+                }
+            }
+        }
 
         const firstText = (selectors, minLen, maxLen) => {
             for (const selector of selectors) {
                 for (const el of document.querySelectorAll(selector)) {
                     if (!visible(el)) continue;
                     const text = clean(el.innerText || el.textContent || '');
-                    if (text.length < minLen || text.length > maxLen || bad(text)) continue;
+                    if (text.length < minLen || text.length > maxLen || bad(text)) {
+                        continue;
+                    }
                     return text;
                 }
             }
             return 'N/A';
         };
 
+        // Keep only the specific structures from the previous working logic.
+        // Do not use broad selectors such as [class*="headline"] or
+        // [class*="description"].
         let headline = firstText([
             '[class*="-e-15"]',
-            '[class*="headline"]',
-            '[aria-label*="Headline"]',
-            '[aria-label*="headline"]',
+            'div[role="link"] > span',
             'div[role="link"] span',
             'div.cS4Vcb-vnv8ic'
         ], 3, 180);
 
         let description = firstText([
             '[class*="-e-67"]',
-            '[class*="long-description"]',
-            '[class*="description"]',
-            '[aria-label*="Description"]',
-            '[aria-label*="description"]',
             'div.HFTpmd-WsjYwc-hgDUwe'
         ], 8, 320);
 
         if (description === headline) description = 'N/A';
 
+        // A dominant image wins over text-like metadata/accessibility content.
+        if (dominantImage) {
+            return {
+                headline: 'N/A',
+                description: 'N/A',
+                score: 0,
+                dominantImage: true
+            };
+        }
+
         let score = 0;
         if (headline !== 'N/A') score += 120;
         if (description !== 'N/A') score += 100;
 
-        return {headline, description, score};
+        return {headline, description, score, dominantImage: false};
     }
     """
 
     candidates = []
 
-    # Prefer visible creative iframes. Hidden/stale frames often contain old
-    # template text and were a source of wrong classifications.
+    # Inspect only visible, reasonably sized creative frames. Hidden/stale
+    # frames are a common source of false text classifications.
     for frame in page.frames:
         if frame == page.main_frame:
             continue
@@ -1487,24 +1555,40 @@ def extract_text_ad_details_once(page):
             box = _frame_parent_box(frame)
             if not box:
                 continue
-            if (box.get("width", 0) or 0) < 100 or (box.get("height", 0) or 0) < 60:
+            width = box.get("width", 0) or 0
+            height = box.get("height", 0) or 0
+            y = box.get("y", 99999) or 99999
+            if width < 100 or height < 60 or y > 1400:
                 continue
-            if (box.get("y", 99999) or 99999) > 1400:
-                continue
+
             result = frame.evaluate(js)
             if result and result.get("score", 0) > 0:
-                area_bonus = min(((box.get("width", 0) or 0) * (box.get("height", 0) or 0)) / 10000, 50)
+                area_bonus = min((width * height) / 10000, 50)
                 candidates.append((result.get("score", 0) + area_bonus, result))
         except Exception:
             continue
 
-    # Main page is only a fallback because it also contains Google page chrome.
-    try:
-        result = page.evaluate(js)
-        if result and result.get("score", 0) > 0:
-            candidates.append((result.get("score", 0) - 40, result))
-    except Exception:
-        pass
+    # Main page fallback is allowed only for strict text-ad structures and only
+    # when it is not dominated by an image. The Google shell is excluded.
+    if not candidates:
+        try:
+            body_text = page.evaluate(
+                "() => document.body ? document.body.innerText.toLowerCase() : ''"
+            )
+            shell_page = (
+                "ads transparency center" in body_text
+                or "ads transparency centre" in body_text
+            )
+            result = page.evaluate(js)
+            if (
+                not shell_page
+                and result
+                and result.get("score", 0) > 0
+                and not result.get("dominantImage", False)
+            ):
+                candidates.append((result.get("score", 0), result))
+        except Exception:
+            pass
 
     if not candidates:
         return {"headline": "N/A", "description": "N/A"}
@@ -1515,7 +1599,6 @@ def extract_text_ad_details_once(page):
         "headline": clean_text(best.get("headline")),
         "description": clean_text(best.get("description")),
     }
-
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """Poll the fast text probe for a bounded amount of time."""
