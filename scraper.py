@@ -52,6 +52,7 @@ CREATIVE_CLASSIFY_TIMEOUT_SECONDS = 8
 IMAGE_TEXT_GRACE_SECONDS = 2.0
 AMBIGUOUS_VIDEO_DETECTION_SECONDS = 8
 VIDEO_PROBE_BEFORE_IMAGE_SECONDS = 5
+VIDEO_PROBE_BEFORE_TEXT_SECONDS = 5
 PLAYWRIGHT_ACTION_TIMEOUT_MS = 4000
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".m3u8")
@@ -167,22 +168,20 @@ def is_real_video_response(response):
 
         if content_type.startswith("video/"):
             return True
-
         if "application/vnd.apple.mpegurl" in content_type:
             return True
-
         if "application/x-mpegurl" in content_type:
             return True
-
-        if "videoplayback" in url:
+        if "videoplayback" in url or "googlevideo.com" in url:
             return True
-
+        if "youtubei/v1/player" in url or "get_video_info" in url:
+            return True
+        if "youtube.com/embed/" in url or "youtu.be/" in url:
+            return True
         if any(ext in url for ext in VIDEO_EXTENSIONS):
             return True
-
     except Exception:
         pass
-
     return False
 
 
@@ -232,43 +231,84 @@ def extract_video_id_from_url(req_url):
     return None
 
 
-def extract_video_from_dom(page):
-    """
-    Checks actual video elements on page and inside frames.
-    """
+def extract_video_id_from_json_payload(payload):
+    """Find a YouTube-style video ID in a player JSON response."""
     try:
-        video_sources = page.evaluate("""
-            () => Array.from(document.querySelectorAll('video'))
-                .map(v => v.currentSrc || v.src || '')
-                .filter(Boolean)
-        """)
-
-        for src in video_sources:
-            video_id = extract_video_id_from_url(src)
-            if video_id:
-                return video_id
-
+        if isinstance(payload, dict):
+            for key in ("videoId", "video_id", "videoid"):
+                value = payload.get(key)
+                if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+                    return value
+            for value in payload.values():
+                found = extract_video_id_from_json_payload(value)
+                if found:
+                    return found
+        elif isinstance(payload, list):
+            for value in payload:
+                found = extract_video_id_from_json_payload(value)
+                if found:
+                    return found
     except Exception:
         pass
+    return None
+
+
+def scan_embedded_video_metadata(page):
+    """Fast scan of frame URLs and rendered HTML for strict 11-character video IDs."""
+    patterns = [
+        re.compile(r'youtube\.com/embed/([A-Za-z0-9_-]{11})', re.I),
+        re.compile(r'youtu\.be/([A-Za-z0-9_-]{11})', re.I),
+        re.compile(r'["\']videoId["\']\s*[:=]\s*["\']([A-Za-z0-9_-]{11})["\']', re.I),
+        re.compile(r'["\']video_id["\']\s*[:=]\s*["\']([A-Za-z0-9_-]{11})["\']', re.I),
+        re.compile(r'data-video-id=["\']([A-Za-z0-9_-]{11})["\']', re.I),
+    ]
 
     for frame in page.frames:
         try:
-            video_sources = frame.evaluate("""
-                () => Array.from(document.querySelectorAll('video'))
-                    .map(v => v.currentSrc || v.src || '')
-                    .filter(Boolean)
-            """)
+            found = extract_video_id_from_url(frame.url)
+            if found:
+                return found
+        except Exception:
+            pass
 
-            for src in video_sources:
-                video_id = extract_video_id_from_url(src)
-                if video_id:
-                    return video_id
-
+        try:
+            html = frame.evaluate("() => document.documentElement ? document.documentElement.outerHTML : ''")
+            if not html:
+                continue
+            for pattern in patterns:
+                match = pattern.search(html)
+                if match:
+                    return match.group(1)
         except Exception:
             continue
 
     return "N/A"
 
+
+def extract_video_from_dom(page):
+    """Check video/source/iframe URLs and frame URLs for an actual video ID."""
+    for frame in page.frames:
+        try:
+            frame_id = extract_video_id_from_url(frame.url)
+            if frame_id:
+                return frame_id
+        except Exception:
+            pass
+
+        try:
+            urls = frame.evaluate("""
+                () => Array.from(document.querySelectorAll('video, source, iframe'))
+                    .map(el => el.currentSrc || el.src || el.getAttribute('src') || '')
+                    .filter(Boolean)
+            """)
+            for src in urls:
+                video_id = extract_video_id_from_url(src)
+                if video_id:
+                    return video_id
+        except Exception:
+            continue
+
+    return "N/A"
 
 def scan_browser_performance_for_video(page):
     """
@@ -429,6 +469,30 @@ def probe_video_before_image(page, captured, max_seconds=VIDEO_PROBE_BEFORE_IMAG
     return scan_browser_performance_for_video(page)
 
 
+def probe_video_before_text(page, captured, max_seconds=VIDEO_PROBE_BEFORE_TEXT_SECONDS):
+    """
+    Confirm that a creative with visible ad copy is not actually a video ad.
+    Video creatives commonly expose headline/description before playback starts.
+    """
+    started = time.time()
+
+    video_id = get_immediate_video_id(page, captured)
+    if video_id != "N/A":
+        return video_id
+
+    # When a play/video hint is visible, activate only the real play target.
+    if has_video_hint(page):
+        click_possible_video_targets(page)
+
+    remaining = max_seconds - (time.time() - started)
+    if remaining > 0:
+        video_id = wait_for_video_id(page, captured, max_seconds=remaining)
+        if video_id != "N/A":
+            return video_id
+
+    return get_immediate_video_id(page, captured)
+
+
 class TransientHTTPError(RuntimeError):
     def __init__(self, status, url, message=None):
         self.status = status
@@ -497,7 +561,7 @@ def navigate_with_retry(page, url, row_num, max_attempts=NAVIGATION_MAX_ATTEMPTS
 
 
 def get_immediate_video_id(page, captured):
-    """No-wait video check using captured responses, DOM and performance entries."""
+    """No-wait video check using responses, DOM, frame URLs, metadata and performance."""
     captured_id = captured.get("video_id", "N/A")
     if captured_id and captured_id != "N/A":
         return captured_id
@@ -505,6 +569,14 @@ def get_immediate_video_id(page, captured):
     video_id = extract_video_from_dom(page)
     if video_id != "N/A":
         return video_id
+
+    # Throttle the heavier HTML metadata scan while classification polls.
+    now = time.time()
+    if now - captured.get("_last_metadata_scan", 0) >= 1.0:
+        captured["_last_metadata_scan"] = now
+        video_id = scan_embedded_video_metadata(page)
+        if video_id != "N/A":
+            return video_id
 
     return scan_browser_performance_for_video(page)
 
@@ -1684,21 +1756,11 @@ def has_visible_image_creative(page):
 
 
 def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT_SECONDS):
-    """
-    Return (kind, video_id, headline, description).
-
-    Priority remains:
-      1. Real video ID
-      2. Visible text ad
-      3. Static image ad
-
-    Before returning ``image``, run one bounded video-start probe. This is the
-    only behavioral correction: text and image handling remain unchanged, while
-    video creatives write their real ID in column F instead of ``image``.
-    """
+    """Return (kind, video_id, headline, description) with video checked before text."""
     deadline = time.time() + max_wait_seconds
     first_image_seen_at = None
     video_probe_done = False
+    text_video_probe_done = False
     last_headline = "N/A"
     last_description = "N/A"
 
@@ -1710,12 +1772,20 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
         text_data = extract_text_ad_details_once(page)
         headline = clean_text(text_data.get("headline"))
         description = clean_text(text_data.get("description"))
-        if is_valid_text_ad(headline, description):
+        has_text = is_valid_text_ad(headline, description)
+        last_headline, last_description = headline, description
+
+        # Headline/description can belong to a VIDEO ad. Never write "text"
+        # until a bounded video-ID probe has completed.
+        if has_text:
+            if not text_video_probe_done:
+                text_video_probe_done = True
+                video_id = probe_video_before_text(page, captured)
+                if video_id != "N/A":
+                    return "video", video_id, "N/A", "N/A"
             return "text", "N/A", headline, description
 
-        last_headline, last_description = headline, description
         image_like = has_visible_image_creative(page)
-
         if image_like:
             if first_image_seen_at is None:
                 first_image_seen_at = time.time()
@@ -1726,11 +1796,15 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
                     if video_id != "N/A":
                         return "video", video_id, "N/A", "N/A"
 
-                    # A click can reveal late text, so let text win once more.
                     text_data = extract_text_ad_details_once(page)
                     headline = clean_text(text_data.get("headline"))
                     description = clean_text(text_data.get("description"))
                     if is_valid_text_ad(headline, description):
+                        if not text_video_probe_done:
+                            text_video_probe_done = True
+                            video_id = probe_video_before_text(page, captured)
+                            if video_id != "N/A":
+                                return "video", video_id, "N/A", "N/A"
                         return "text", "N/A", headline, description
 
                 return "image", "N/A", "N/A", "N/A"
@@ -1739,12 +1813,7 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
 
         page.wait_for_timeout(500)
 
-    # Ambiguous non-image creatives retain the existing bounded video logic.
-    video_id = detect_video_id(
-        page,
-        captured,
-        max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS,
-    )
+    video_id = detect_video_id(page, captured, max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS)
     if video_id != "N/A":
         return "video", video_id, "N/A", "N/A"
 
@@ -1752,6 +1821,10 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
     headline = clean_text(text_data.get("headline"))
     description = clean_text(text_data.get("description"))
     if is_valid_text_ad(headline, description):
+        if not text_video_probe_done:
+            video_id = probe_video_before_text(page, captured)
+            if video_id != "N/A":
+                return "video", video_id, "N/A", "N/A"
         return "text", "N/A", headline, description
 
     if has_visible_image_creative(page):
@@ -1846,7 +1919,16 @@ def scrape_single_url(url_row):
                 try:
                     if not is_real_video_response(response):
                         return
+
                     found_id = extract_video_id_from_url(response.url)
+
+                    # YouTube player endpoints often contain the real ID only in JSON.
+                    if not found_id and "youtubei/v1/player" in response.url.lower():
+                        try:
+                            found_id = extract_video_id_from_json_payload(response.json())
+                        except Exception:
+                            found_id = None
+
                     if found_id and captured["video_id"] == "N/A":
                         captured["video_id"] = found_id
                 except Exception:
