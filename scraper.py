@@ -28,22 +28,29 @@ INSTALL_SELECTORS = [
 ]
 
 
-def safe_update_scrape_result(
-    row_num,
-    combined_data,
-    headline,
-    description,
-    image_url,
-):
-    """Write A:G and M:O atomically through the shared Sheets retry layer."""
+def safe_update_combined_row(row_num, data):
+    """
+    Thread-safe Google Sheet row update.
+    Browser scraping runs parallel, but sheet writing is protected.
+    """
     with SHEET_LOCK:
-        sheets.update_scrape_result(
-            row_index=row_num,
-            combined_data=combined_data,
-            headline=headline,
-            description=description,
-            image_url=image_url,
-        )
+        sheets.update_combined_row(row_num, data)
+
+
+def safe_update_headline_desc(row_num, headline, description):
+    """
+    Thread-safe Google Sheet row update for Headline and Description in cols M and N.
+    """
+    with SHEET_LOCK:
+        sheets.update_headline_and_description(row_num, headline, description)
+
+
+def safe_update_image_url(row_num, image_url):
+    """
+    Thread-safe Google Sheet row update for Image URL in column O.
+    """
+    with SHEET_LOCK:
+        sheets.update_image_url(row_num, image_url)
 
 
 def safe_add_log(row_number, status, log_type, url="", video_id="", app_link="", message=""):
@@ -181,72 +188,88 @@ def extract_video_id_from_url(req_url):
     return None
 
 
-def extract_video_from_dom(page):
-    """
-    Checks actual video elements on page and inside frames.
-    """
+def _iter_video_targets(page, frame_limit=12):
+    """Return a bounded frame list without layout/bounding-box calls."""
+    targets = [page]
     try:
-        video_sources = page.evaluate("""
-            () => Array.from(document.querySelectorAll('video'))
-                .map(v => v.currentSrc || v.src || '')
-                .filter(Boolean)
-        """)
-
-        for src in video_sources:
-            video_id = extract_video_id_from_url(src)
-            if video_id:
-                return video_id
-
+        frames = [frame for frame in page.frames if frame != page.main_frame]
     except Exception:
-        pass
+        frames = []
 
-    for frame in page.frames:
+    def priority(frame):
         try:
-            video_sources = frame.evaluate("""
-                () => Array.from(document.querySelectorAll('video'))
-                    .map(v => v.currentSrc || v.src || '')
-                    .filter(Boolean)
-            """)
+            url = (frame.url or "").lower()
+        except Exception:
+            url = ""
 
-            for src in video_sources:
+        score = 0
+        for token, weight in (
+            ("youtube", 100),
+            ("videoplayback", 100),
+            ("safeframe", 80),
+            ("adframe", 70),
+            ("googlesyndication", 60),
+            ("doubleclick", 50),
+        ):
+            if token in url:
+                score += weight
+        return score
+
+    # URL inspection is non-blocking. Avoid frame_element/bounding_box here because
+    # stale frames can consume the Playwright timeout one by one.
+    frames.sort(key=priority, reverse=True)
+    targets.extend(frames[:frame_limit])
+    return targets
+
+
+def extract_video_from_dom(page, frame_limit=12):
+    """Check a bounded set of active targets for real <video> sources."""
+    for target in _iter_video_targets(page, frame_limit=frame_limit):
+        try:
+            videos = target.locator("video")
+            count = min(videos.count(), 4)
+        except Exception:
+            continue
+
+        for i in range(count):
+            try:
+                src = videos.nth(i).evaluate(
+                    "v => v.currentSrc || v.src || ''",
+                    timeout=800,
+                )
                 video_id = extract_video_id_from_url(src)
                 if video_id:
                     return video_id
-
-        except Exception:
-            continue
+            except Exception:
+                continue
 
     return "N/A"
 
 
 def scan_browser_performance_for_video(page):
-    """
-    Scans performance entries for real video URLs only.
-    """
+    """Scan main-page resource entries with a strict Playwright timeout."""
     try:
-        urls = page.evaluate("""
-            () => performance.getEntriesByType('resource').map(r => r.name)
-        """)
+        urls = page.locator("html").evaluate(
+            "el => performance.getEntriesByType('resource').map(r => r.name)",
+            timeout=1000,
+        )
 
-        for u in urls:
-            u_lower = u.lower()
-
+        for resource_url in urls or []:
+            lower = resource_url.lower()
             if (
-                "videoplayback" in u_lower
-                or ".mp4" in u_lower
-                or ".webm" in u_lower
-                or ".mov" in u_lower
-                or ".m4v" in u_lower
-                or ".m3u8" in u_lower
-                or "youtube.com/embed/" in u_lower
-                or "youtube.com/watch" in u_lower
-                or "youtu.be/" in u_lower
+                "videoplayback" in lower
+                or ".mp4" in lower
+                or ".webm" in lower
+                or ".mov" in lower
+                or ".m4v" in lower
+                or ".m3u8" in lower
+                or "youtube.com/embed/" in lower
+                or "youtube.com/watch" in lower
+                or "youtu.be/" in lower
             ):
-                video_id = extract_video_id_from_url(u)
-
+                video_id = extract_video_id_from_url(resource_url)
                 if video_id:
                     return video_id
-
     except Exception:
         pass
 
@@ -254,95 +277,95 @@ def scan_browser_performance_for_video(page):
 
 
 def click_possible_video_targets(page):
-    """
-    Clicks possible video preview areas.
-    Avoids install buttons/app links.
-    """
+    """Try one bounded click on a genuine play/video target."""
     selectors = [
+        'button[aria-label*="Play" i]',
+        'button[title*="Play" i]',
+        'div[aria-label*="Play" i]',
         "video",
-        "iframe",
-        "creative-preview",
-        'button[aria-label*="Play"]',
-        'button[title*="Play"]',
-        'div[aria-label*="Play"]',
-        'img[src*="play"]'
+        'img[src*="play" i]',
     ]
 
-    for sel in selectors:
-        try:
-            elements = page.locator(sel)
-            count = elements.count()
+    for target in _iter_video_targets(page, frame_limit=8):
+        for selector in selectors:
+            try:
+                elements = target.locator(selector)
+                count = min(elements.count(), 3)
+            except Exception:
+                continue
 
             for i in range(count):
-                el = elements.nth(i)
-
-                if not el.is_visible():
-                    continue
-
                 try:
-                    el.scroll_into_view_if_needed(timeout=2000)
-                    box = el.bounding_box()
-
+                    element = elements.nth(i)
+                    if not element.is_visible(timeout=500):
+                        continue
+                    box = element.bounding_box(timeout=800)
                     if not box:
                         continue
-
-                    if box["width"] < 120 or box["height"] < 80:
+                    if box["width"] < 80 or box["height"] < 50:
                         continue
 
+                    element.scroll_into_view_if_needed(timeout=800)
                     x = box["x"] + box["width"] / 2
                     y = box["y"] + box["height"] / 2
-
                     page.mouse.click(x, y)
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(750)
                     return True
-
                 except Exception:
                     continue
-
-        except Exception:
-            continue
 
     return False
 
 
-def wait_for_video_id(page, captured, max_seconds=20):
-    waited = 0
+def wait_for_video_id(page, captured, max_seconds=8):
+    """Use a real wall-clock deadline; never multiply frame-scan latency."""
+    deadline = time.monotonic() + max_seconds
 
-    while waited < max_seconds:
-        if captured.get("video_id") and captured["video_id"] != "N/A":
-            return captured["video_id"]
+    while time.monotonic() < deadline:
+        captured_id = captured.get("video_id", "N/A")
+        if captured_id and captured_id != "N/A":
+            return captured_id
 
-        dom_video_id = extract_video_from_dom(page)
+        dom_video_id = extract_video_from_dom(page, frame_limit=12)
         if dom_video_id != "N/A":
             return dom_video_id
 
-        page.wait_for_timeout(500)
-        waited += 0.5
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        page.wait_for_timeout(min(500, max(100, int(remaining * 1000))))
 
     return "N/A"
 
 
 def detect_video_id(page, captured):
-    """
-    Main video detection flow.
-    """
-    video_id = extract_video_from_dom(page)
+    """Bounded video-first detection that cannot expand into multi-minute waits."""
+    captured_id = captured.get("video_id", "N/A")
+    if captured_id and captured_id != "N/A":
+        return captured_id
 
-    if video_id == "N/A":
-        click_possible_video_targets(page)
-        video_id = wait_for_video_id(page, captured, max_seconds=15)
+    video_id = extract_video_from_dom(page, frame_limit=12)
+    if video_id != "N/A":
+        return video_id
 
-    if video_id == "N/A":
-        video_id = scan_browser_performance_for_video(page)
+    click_possible_video_targets(page)
+    video_id = wait_for_video_id(page, captured, max_seconds=8)
+    if video_id != "N/A":
+        return video_id
 
-    if video_id == "N/A":
-        page.mouse.wheel(0, 400)
-        page.wait_for_timeout(1500)
+    video_id = scan_browser_performance_for_video(page)
+    if video_id != "N/A":
+        return video_id
 
-        click_possible_video_targets(page)
-        video_id = wait_for_video_id(page, captured, max_seconds=10)
+    # One final short probe after a small scroll. No second long loop.
+    try:
+        page.mouse.wheel(0, 300)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
 
-    return video_id
+    click_possible_video_targets(page)
+    return wait_for_video_id(page, captured, max_seconds=4)
 
 
 # =========================
@@ -1373,23 +1396,43 @@ def get_ranked_non_video_targets(page):
     return ranked
 
 
-def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
+def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target=None, image_box=None):
     """
-    Extract headline and description for TEXT ads using the original working logic.
+    Extract headline/description from the SAME creative target where the image URL was found.
 
-    Important:
-    - This function is only used after video and active image detection both fail.
-    - It does not use image boxes, install-button position, font size, or generic leaf text.
-    - It checks the main rendered creative first, then its iframes.
-    - Visibility is intentionally relaxed for offscreen and RTL/localized creatives.
+    Updated rule for your current Google ad layout:
+    - Use Install/Get/Download/Open/Learn more only as an ANCHOR, never as headline/description.
+    - First usable visible text BELOW the install anchor = headline.
+    - Next usable visible text BELOW headline = description.
+    - Description is selected by vertical position, not by length.
+    - If no install anchor is found, fallback picks first usable text below/near the image, then the next text below it.
     """
     js = r"""
-    () => {
+    (imageBox) => {
         const cleanText = (txt) => (txt || "")
             .replace(/\u00a0/g, " ")
             .replace(/\n/g, " ")
             .replace(/\s+/g, " ")
             .trim();
+
+        const directTextOnly = (el) => cleanText(
+            Array.from(el.childNodes || [])
+                .filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => n.textContent || "")
+                .join(" ")
+        );
+
+        const rectObj = (el) => {
+            const rect = el.getBoundingClientRect();
+            return {
+                top: rect.top,
+                bottom: rect.bottom,
+                left: rect.left,
+                right: rect.right,
+                width: rect.width,
+                height: rect.height
+            };
+        };
 
         const isVisible = (el) => {
             if (!el) return false;
@@ -1398,43 +1441,266 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             return (
                 rect.width > 0 &&
                 rect.height > 0 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
                 style.visibility !== "hidden" &&
                 style.display !== "none" &&
                 style.opacity !== "0"
             );
         };
 
-        let headline = "N/A";
-        let description = "N/A";
+        const horizontalOverlapRatio = (a, b) => {
+            const overlap = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+            return overlap / Math.max(1, Math.min(a.width, b.width));
+        };
 
-        // Original working text-ad selectors.
-        const headlineEl = document.querySelector(
-            'div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic'
-        );
-        if (headlineEl && isVisible(headlineEl)) {
-            const value = cleanText(headlineEl.innerText || headlineEl.textContent);
-            if (value && !value.includes("{{")) {
-                headline = value;
+        const centerX = (b) => b.left + b.width / 2;
+        const img = imageBox && imageBox.url !== "N/A" ? imageBox : null;
+
+        const isInstallAnchorText = (txt) => {
+            const lower = cleanText(txt).toLowerCase();
+            if (!lower) return false;
+            if (["install", "get", "download", "open", "learn more", "try now"].includes(lower)) return true;
+            // Button text sometimes includes spaces/newlines or localized extra symbols.
+            if (lower.length <= 25 && /\b(install|get|download|open|learn more|try now)\b/i.test(lower)) return true;
+            return false;
+        };
+
+        const isBadText = (txt) => {
+            const original = cleanText(txt);
+            const lower = original.toLowerCase();
+            if (!lower) return true;
+
+            // Button labels are anchors only; never save them as headline/description.
+            if (isInstallAnchorText(lower)) return true;
+
+            const exactBad = new Set([
+                "play", "close", "menu", "search", "sign in", "log in",
+                "privacy", "terms", "help", "ad", "ads", "skip", "next"
+            ]);
+            if (exactBad.has(lower)) return true;
+
+            const badContains = [
+                "ads transparency center",
+                "ads transparency centre",
+                "report this ad",
+                "see more ads",
+                "last shown",
+                "shown in",
+                "about this ad",
+                "my ad center",
+                "why this ad",
+                "ad choices",
+                "advertiser verified",
+                "this advertiser",
+                "more details",
+                "play.google.com/store/apps/details"
+            ];
+            if (badContains.some(b => lower.includes(b))) return true;
+
+            if (/^https?:\/\//i.test(lower)) return true;
+            if (/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$/i.test(lower)) return true;
+            if (/^[a-z0-9_-]{20,}$/i.test(lower)) return true;
+
+            return false;
+        };
+
+        const insideOrNearImage = (box) => {
+            if (!img) return true;
+            const imageBoxForOverlap = {
+                top: img.top,
+                bottom: img.bottom,
+                left: img.left,
+                right: img.right,
+                width: img.width,
+                height: img.height
+            };
+            const alignedWithImage = horizontalOverlapRatio(box, imageBoxForOverlap) >= 0.10;
+            const verticalNearImage = box.top >= img.top - 40 && box.top <= img.bottom + 650;
+            const overlayOrInsideImage = box.top >= img.top - 20 && box.bottom <= img.bottom + 120;
+            return alignedWithImage && (verticalNearImage || overlayOrInsideImage);
+        };
+
+        const installAnchors = [];
+        const textCandidates = [];
+
+        for (const el of Array.from(document.querySelectorAll("body *"))) {
+            if (!isVisible(el)) continue;
+
+            const rawText = cleanText(el.innerText || el.textContent || "");
+            if (!rawText) continue;
+
+            const cls = String(el.className || "").toLowerCase();
+            const aria = String(el.getAttribute("aria-label") || "").toLowerCase();
+            const role = String(el.getAttribute("role") || "").toLowerCase();
+            const href = String(el.getAttribute("href") || el.href || el.getAttribute("data-href") || "").toLowerCase();
+            const box = rectObj(el);
+            if (box.width < 10 || box.height < 6) continue;
+
+            const looksInstallByClass =
+                cls.includes("install-button") ||
+                cls.includes("install") ||
+                aria.includes("install") ||
+                href.includes("googleadservices.com/pagead/aclk") ||
+                href.includes("play.google.com/store/apps/details");
+
+            if ((isInstallAnchorText(rawText) || looksInstallByClass) && insideOrNearImage(box)) {
+                let score = 0;
+                if (isInstallAnchorText(rawText)) score += 200;
+                if (cls.includes("install-button")) score += 160;
+                if (role === "link" || el.tagName.toLowerCase() === "a" || el.tagName.toLowerCase() === "button") score += 60;
+                if (img) {
+                    score -= Math.min(Math.abs(box.top - img.bottom), 500) / 2;
+                    score -= Math.min(Math.abs(centerX(box) - centerX(img)), 500) / 5;
+                }
+                installAnchors.push({ text: rawText, ...box, score });
+                continue;
             }
+
+            if (rawText.length < 3 || rawText.length > 240) continue;
+            if (rawText.includes("{{") || rawText.includes("}}")) continue;
+            if (isBadText(rawText)) continue;
+
+            const looksLikeTextNode =
+                cls.includes("headline") ||
+                cls.includes("description") ||
+                cls.includes("long-description") ||
+                cls.includes("-e-15") ||
+                cls.includes("-e-67") ||
+                aria.includes("headline") ||
+                aria.includes("description") ||
+                role === "heading";
+
+            // Avoid wrapper containers that combine button + headline + description.
+            const directText = directTextOnly(el);
+            if (el.children.length > 0 && !looksLikeTextNode && directText.length < 3) continue;
+            if (!insideOrNearImage(box)) continue;
+
+            const style = window.getComputedStyle(el);
+            const fontSize = parseFloat(style.fontSize || "0") || 0;
+            const weightRaw = String(style.fontWeight || "400");
+            const fontWeight = weightRaw === "bold" ? 700 : (parseInt(weightRaw, 10) || 400);
+
+            textCandidates.push({
+                text: rawText,
+                ...box,
+                fontSize,
+                fontWeight,
+                isHeadlineClass: cls.includes("headline") || cls.includes("-e-15") || aria.includes("headline"),
+                isDescriptionClass: cls.includes("description") || cls.includes("long-description") || cls.includes("-e-67") || aria.includes("description")
+            });
         }
 
-        const descriptionEl = document.querySelector(
-            'div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic'
-        );
-        if (descriptionEl && isVisible(descriptionEl)) {
-            const value = cleanText(descriptionEl.innerText || descriptionEl.textContent);
-            if (value && !value.includes("{{")) {
-                description = value;
-            }
+        const unique = [];
+        const seen = new Set();
+        for (const c of textCandidates) {
+            // Keep same text only once; prefer the visually top/left smaller element, not wrapper duplicates.
+            const key = c.text.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            unique.push(c);
         }
 
-        return { headline, description };
+        if (!unique.length) {
+            return { headline: "N/A", description: "N/A", mode: "no_text" };
+        }
+
+        unique.sort((a, b) => {
+            if (Math.abs(a.top - b.top) > 6) return a.top - b.top;
+            return a.left - b.left;
+        });
+
+        let headlineObj = null;
+        let descriptionObj = null;
+        let mode = "fallback_image_order";
+
+        if (installAnchors.length) {
+            installAnchors.sort((a, b) => b.score - a.score);
+            const anchor = installAnchors[0];
+            mode = "install_anchor";
+
+            const belowInstall = unique
+                .filter(c => c.top >= anchor.bottom - 12)
+                .filter(c => c.top <= anchor.bottom + 360)
+                .filter(c => Math.abs(centerX(c) - centerX(anchor)) <= Math.max(420, anchor.width * 3))
+                .map(c => {
+                    const distance = Math.max(0, c.top - anchor.bottom);
+                    let score = 1000 - Math.min(distance, 1000);
+                    if (c.isHeadlineClass) score += 180;
+                    if (c.isDescriptionClass) score -= 90;
+                    if (c.fontWeight >= 600) score += 50;
+                    if (img) score -= Math.min(Math.abs(centerX(c) - centerX(img)), 500) / 8;
+                    return { ...c, score };
+                })
+                .sort((a, b) => {
+                    // Main rule: first usable visible text below install.
+                    if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+                    return b.score - a.score;
+                });
+
+            headlineObj = belowInstall.length ? belowInstall[0] : null;
+        }
+
+        // Fallback when install anchor is not available: first usable text below/near the image.
+        if (!headlineObj) {
+            let pool = unique;
+            if (img) {
+                pool = unique.filter(c => c.top >= img.bottom - 30 || (c.top >= img.top - 20 && c.bottom <= img.bottom + 120));
+            }
+
+            pool = pool.map(c => {
+                let score = 0;
+                if (img) score -= Math.min(Math.max(0, c.top - img.bottom), 600);
+                if (c.isHeadlineClass) score += 150;
+                if (c.isDescriptionClass) score -= 80;
+                if (c.fontWeight >= 600) score += 30;
+                return { ...c, score };
+            }).sort((a, b) => {
+                if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+                return b.score - a.score;
+            });
+
+            headlineObj = pool.length ? pool[0] : unique[0];
+        }
+
+        if (headlineObj) {
+            const belowHeadline = unique
+                .filter(c => c.text !== headlineObj.text)
+                .filter(c => c.top >= headlineObj.bottom - 10)
+                .filter(c => c.top <= headlineObj.bottom + 320)
+                .filter(c => Math.abs(centerX(c) - centerX(headlineObj)) <= Math.max(420, headlineObj.width * 2.5))
+                .map(c => {
+                    const distance = Math.max(0, c.top - headlineObj.bottom);
+                    let score = 1000 - Math.min(distance, 1000);
+                    if (c.isDescriptionClass) score += 180;
+                    if (c.isHeadlineClass) score -= 80;
+                    if (c.fontSize <= headlineObj.fontSize + 4) score += 30;
+                    return { ...c, score };
+                })
+                .sort((a, b) => {
+                    // Main rule: next usable visible text below headline.
+                    if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+                    return b.score - a.score;
+                });
+
+            descriptionObj = belowHeadline.length ? belowHeadline[0] : null;
+        }
+
+        return {
+            headline: headlineObj ? headlineObj.text : "N/A",
+            description: descriptionObj ? descriptionObj.text : "N/A",
+            mode,
+            textCount: unique.length,
+            installCount: installAnchors.length
+        };
     }
     """
 
     def read_target(target):
         try:
-            data = target.evaluate(js)
+            data = target.evaluate(js, image_box or None)
             if not data:
                 return None
 
@@ -1442,10 +1708,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             description = clean_text(data.get("description"))
 
             if headline != "N/A" or description != "N/A":
-                return {
-                    "headline": headline,
-                    "description": description,
-                }
+                return {"headline": headline, "description": description}
         except Exception:
             return None
         return None
@@ -1453,16 +1716,22 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
-        # Preserve the original order: main rendered creative first.
-        data = read_target(page)
-        if data:
-            return data
+        # Strong fix: if the image target is known, ONLY read text from that same target.
+        if preferred_target is not None:
+            data = read_target(preferred_target)
+            if data:
+                return data
+            page.wait_for_timeout(1000)
+            continue
 
-        # Then check each iframe in browser order, exactly like the working version.
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            data = read_target(frame)
+        # Fallback for video/text-only ads where no image target exists.
+        try:
+            ranked_targets = get_ranked_non_video_targets(page)
+        except Exception:
+            ranked_targets = []
+
+        for _, target, _, _ in ranked_targets:
+            data = read_target(target)
             if data:
                 return data
 
@@ -1471,12 +1740,13 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     return {"headline": "N/A", "description": "N/A"}
 
 
+
 # =========================
 # IMAGE AD ACTIVE-TARGET LOGIC (DEBUG-BASED FIX)
 # =========================
 
-IMAGE_AD_MIN_WAIT_SECONDS = 10
-IMAGE_AD_MAX_WAIT_SECONDS = 25
+IMAGE_AD_MIN_WAIT_SECONDS = 4
+IMAGE_AD_MAX_WAIT_SECONDS = 15
 
 
 def extract_image_ad_text_quick_from_target(target, image_box=None):
@@ -2272,9 +2542,9 @@ def save_scrape_result(
     description = clean_text(description)
     image_url = clean_text(image_url)
 
-    safe_update_scrape_result(
-        row_num=row_num,
-        combined_data=[
+    safe_update_combined_row(
+        row_num,
+        [
             clean_text(advertiser),
             package_name,
             transparency_url,
@@ -2283,10 +2553,9 @@ def save_scrape_result(
             media_value,
             event_time,
         ],
-        headline=headline,
-        description=description,
-        image_url=image_url,
     )
+    safe_update_headline_desc(row_num, headline, description)
+    safe_update_image_url(row_num, image_url)
     safe_add_log(
         row_number=row_num,
         status=status,
@@ -2329,8 +2598,8 @@ def reset_page_after_video_probe(page, url):
     Video probing may click or scroll a preview. Reload before non-video extraction
     so image and text logic starts from the original active creative.
     """
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(4000)
+    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(2500)
 
 
 def scrape_single_url(url_row):
@@ -2358,6 +2627,8 @@ def scrape_single_url(url_row):
             ),
         )
         page = context.new_page()
+        page.set_default_timeout(3000)
+        page.set_default_navigation_timeout(45000)
         captured = {"video_id": "N/A"}
 
         def handle_response(response):
@@ -2377,7 +2648,7 @@ def scrape_single_url(url_row):
                 separator = "&" if "?" in url else "?"
                 url = f"{url}{separator}region=anywhere"
 
-            print(f"🔍 Row {row_num}: opening transparency URL")
+            print(f"🔍 Row {row_num}: opening transparency URL", flush=True)
             safe_add_log(
                 row_number=row_num,
                 status="STARTED",
@@ -2386,12 +2657,20 @@ def scrape_single_url(url_row):
                 message="Started combined video/image/text extraction",
             )
 
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4000)
-            advertiser = extract_advertiser_from_page(page)
+            nav_started = time.monotonic()
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            print(f"🌐 Row {row_num}: page loaded in {time.monotonic() - nav_started:.1f}s", flush=True)
+            page.wait_for_timeout(3000)
 
-            # 1) VIDEO: preserve the original working video-first detection flow.
+            advertiser_started = time.monotonic()
+            advertiser = extract_advertiser_from_page(page)
+            print(f"🏢 Row {row_num}: advertiser extracted in {time.monotonic() - advertiser_started:.1f}s", flush=True)
+
+            # 1) VIDEO: preserve video-first behavior with bounded waits.
+            print(f"🎥 Row {row_num}: starting bounded video probe", flush=True)
+            video_started = time.monotonic()
             video_id = detect_video_id(page, captured)
+            print(f"🎥 Row {row_num}: video probe finished in {time.monotonic() - video_started:.1f}s; result={video_id}", flush=True)
             if video_id != "N/A":
                 print(f"🎬 Row {row_num}: video ID found: {video_id}")
                 app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
@@ -2425,16 +2704,21 @@ def scrape_single_url(url_row):
                 return
 
             # Restore the unmodified creative before image/text extraction.
-            print(f"📄 Row {row_num}: no video found; resetting preview for non-video extraction")
+            print(f"📄 Row {row_num}: no video found; resetting preview for non-video extraction", flush=True)
+            reset_started = time.monotonic()
             reset_page_after_video_probe(page, url)
+            print(f"🔄 Row {row_num}: preview reset in {time.monotonic() - reset_started:.1f}s", flush=True)
             advertiser = extract_advertiser_from_page(page)
 
             # 2) IMAGE: use the active-root/child-frame lock from the working image scraper.
+            print(f"🖼 Row {row_num}: starting active image extraction", flush=True)
+            image_started = time.monotonic()
             image_ad = wait_and_extract_active_image_ad_data(
                 page,
                 max_wait_seconds=IMAGE_AD_MAX_WAIT_SECONDS,
                 min_wait_seconds=IMAGE_AD_MIN_WAIT_SECONDS,
             )
+            print(f"🖼 Row {row_num}: image extraction finished in {time.monotonic() - image_started:.1f}s; found={bool(image_ad)}", flush=True)
 
             if image_ad and clean_text(image_ad.get("image_url")) != "N/A":
                 image_url = clean_text(image_ad.get("image_url"))
@@ -2482,8 +2766,10 @@ def scrape_single_url(url_row):
                 return
 
             # 3) TEXT: use the original ranked-target text extraction and strict package matching.
-            print(f"📝 Row {row_num}: no active image creative found; checking text ad")
+            print(f"📝 Row {row_num}: no active image creative found; checking text ad", flush=True)
+            text_started = time.monotonic()
             text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+            print(f"📝 Row {row_num}: text extraction finished in {time.monotonic() - text_started:.1f}s", flush=True)
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
 
@@ -2570,11 +2856,12 @@ def scrape_single_url(url_row):
 
 
 def run_parallel_combined_scraper(max_workers=2):
-    # Exact row numbers prevent blank input rows from shifting output writes.
+    urls = sheets.get_urls_with_retry()
+
     url_rows = [
-        (row_num, url.strip())
-        for row_num, url in sheets.get_url_rows_with_retry(only_unprocessed=False)
-        if url and url.strip()
+        (i + 2, u.strip())
+        for i, u in enumerate(urls)
+        if u and u.strip()
     ]
 
     if not url_rows:
