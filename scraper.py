@@ -1373,43 +1373,23 @@ def get_ranked_non_video_targets(page):
     return ranked
 
 
-def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target=None, image_box=None):
+def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extract headline/description from the SAME creative target where the image URL was found.
+    Extract headline and description for TEXT ads using the original working logic.
 
-    Updated rule for your current Google ad layout:
-    - Use Install/Get/Download/Open/Learn more only as an ANCHOR, never as headline/description.
-    - First usable visible text BELOW the install anchor = headline.
-    - Next usable visible text BELOW headline = description.
-    - Description is selected by vertical position, not by length.
-    - If no install anchor is found, fallback picks first usable text below/near the image, then the next text below it.
+    Important:
+    - This function is only used after video and active image detection both fail.
+    - It does not use image boxes, install-button position, font size, or generic leaf text.
+    - It checks the main rendered creative first, then its iframes.
+    - Visibility is intentionally relaxed for offscreen and RTL/localized creatives.
     """
     js = r"""
-    (imageBox) => {
+    () => {
         const cleanText = (txt) => (txt || "")
             .replace(/\u00a0/g, " ")
             .replace(/\n/g, " ")
             .replace(/\s+/g, " ")
             .trim();
-
-        const directTextOnly = (el) => cleanText(
-            Array.from(el.childNodes || [])
-                .filter(n => n.nodeType === Node.TEXT_NODE)
-                .map(n => n.textContent || "")
-                .join(" ")
-        );
-
-        const rectObj = (el) => {
-            const rect = el.getBoundingClientRect();
-            return {
-                top: rect.top,
-                bottom: rect.bottom,
-                left: rect.left,
-                right: rect.right,
-                width: rect.width,
-                height: rect.height
-            };
-        };
 
         const isVisible = (el) => {
             if (!el) return false;
@@ -1418,266 +1398,43 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             return (
                 rect.width > 0 &&
                 rect.height > 0 &&
-                rect.bottom > 0 &&
-                rect.right > 0 &&
-                rect.top < window.innerHeight &&
-                rect.left < window.innerWidth &&
                 style.visibility !== "hidden" &&
                 style.display !== "none" &&
                 style.opacity !== "0"
             );
         };
 
-        const horizontalOverlapRatio = (a, b) => {
-            const overlap = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
-            return overlap / Math.max(1, Math.min(a.width, b.width));
-        };
+        let headline = "N/A";
+        let description = "N/A";
 
-        const centerX = (b) => b.left + b.width / 2;
-        const img = imageBox && imageBox.url !== "N/A" ? imageBox : null;
-
-        const isInstallAnchorText = (txt) => {
-            const lower = cleanText(txt).toLowerCase();
-            if (!lower) return false;
-            if (["install", "get", "download", "open", "learn more", "try now"].includes(lower)) return true;
-            // Button text sometimes includes spaces/newlines or localized extra symbols.
-            if (lower.length <= 25 && /\b(install|get|download|open|learn more|try now)\b/i.test(lower)) return true;
-            return false;
-        };
-
-        const isBadText = (txt) => {
-            const original = cleanText(txt);
-            const lower = original.toLowerCase();
-            if (!lower) return true;
-
-            // Button labels are anchors only; never save them as headline/description.
-            if (isInstallAnchorText(lower)) return true;
-
-            const exactBad = new Set([
-                "play", "close", "menu", "search", "sign in", "log in",
-                "privacy", "terms", "help", "ad", "ads", "skip", "next"
-            ]);
-            if (exactBad.has(lower)) return true;
-
-            const badContains = [
-                "ads transparency center",
-                "ads transparency centre",
-                "report this ad",
-                "see more ads",
-                "last shown",
-                "shown in",
-                "about this ad",
-                "my ad center",
-                "why this ad",
-                "ad choices",
-                "advertiser verified",
-                "this advertiser",
-                "more details",
-                "play.google.com/store/apps/details"
-            ];
-            if (badContains.some(b => lower.includes(b))) return true;
-
-            if (/^https?:\/\//i.test(lower)) return true;
-            if (/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$/i.test(lower)) return true;
-            if (/^[a-z0-9_-]{20,}$/i.test(lower)) return true;
-
-            return false;
-        };
-
-        const insideOrNearImage = (box) => {
-            if (!img) return true;
-            const imageBoxForOverlap = {
-                top: img.top,
-                bottom: img.bottom,
-                left: img.left,
-                right: img.right,
-                width: img.width,
-                height: img.height
-            };
-            const alignedWithImage = horizontalOverlapRatio(box, imageBoxForOverlap) >= 0.10;
-            const verticalNearImage = box.top >= img.top - 40 && box.top <= img.bottom + 650;
-            const overlayOrInsideImage = box.top >= img.top - 20 && box.bottom <= img.bottom + 120;
-            return alignedWithImage && (verticalNearImage || overlayOrInsideImage);
-        };
-
-        const installAnchors = [];
-        const textCandidates = [];
-
-        for (const el of Array.from(document.querySelectorAll("body *"))) {
-            if (!isVisible(el)) continue;
-
-            const rawText = cleanText(el.innerText || el.textContent || "");
-            if (!rawText) continue;
-
-            const cls = String(el.className || "").toLowerCase();
-            const aria = String(el.getAttribute("aria-label") || "").toLowerCase();
-            const role = String(el.getAttribute("role") || "").toLowerCase();
-            const href = String(el.getAttribute("href") || el.href || el.getAttribute("data-href") || "").toLowerCase();
-            const box = rectObj(el);
-            if (box.width < 10 || box.height < 6) continue;
-
-            const looksInstallByClass =
-                cls.includes("install-button") ||
-                cls.includes("install") ||
-                aria.includes("install") ||
-                href.includes("googleadservices.com/pagead/aclk") ||
-                href.includes("play.google.com/store/apps/details");
-
-            if ((isInstallAnchorText(rawText) || looksInstallByClass) && insideOrNearImage(box)) {
-                let score = 0;
-                if (isInstallAnchorText(rawText)) score += 200;
-                if (cls.includes("install-button")) score += 160;
-                if (role === "link" || el.tagName.toLowerCase() === "a" || el.tagName.toLowerCase() === "button") score += 60;
-                if (img) {
-                    score -= Math.min(Math.abs(box.top - img.bottom), 500) / 2;
-                    score -= Math.min(Math.abs(centerX(box) - centerX(img)), 500) / 5;
-                }
-                installAnchors.push({ text: rawText, ...box, score });
-                continue;
+        // Original working text-ad selectors.
+        const headlineEl = document.querySelector(
+            'div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic'
+        );
+        if (headlineEl && isVisible(headlineEl)) {
+            const value = cleanText(headlineEl.innerText || headlineEl.textContent);
+            if (value && !value.includes("{{")) {
+                headline = value;
             }
-
-            if (rawText.length < 3 || rawText.length > 240) continue;
-            if (rawText.includes("{{") || rawText.includes("}}")) continue;
-            if (isBadText(rawText)) continue;
-
-            const looksLikeTextNode =
-                cls.includes("headline") ||
-                cls.includes("description") ||
-                cls.includes("long-description") ||
-                cls.includes("-e-15") ||
-                cls.includes("-e-67") ||
-                aria.includes("headline") ||
-                aria.includes("description") ||
-                role === "heading";
-
-            // Avoid wrapper containers that combine button + headline + description.
-            const directText = directTextOnly(el);
-            if (el.children.length > 0 && !looksLikeTextNode && directText.length < 3) continue;
-            if (!insideOrNearImage(box)) continue;
-
-            const style = window.getComputedStyle(el);
-            const fontSize = parseFloat(style.fontSize || "0") || 0;
-            const weightRaw = String(style.fontWeight || "400");
-            const fontWeight = weightRaw === "bold" ? 700 : (parseInt(weightRaw, 10) || 400);
-
-            textCandidates.push({
-                text: rawText,
-                ...box,
-                fontSize,
-                fontWeight,
-                isHeadlineClass: cls.includes("headline") || cls.includes("-e-15") || aria.includes("headline"),
-                isDescriptionClass: cls.includes("description") || cls.includes("long-description") || cls.includes("-e-67") || aria.includes("description")
-            });
         }
 
-        const unique = [];
-        const seen = new Set();
-        for (const c of textCandidates) {
-            // Keep same text only once; prefer the visually top/left smaller element, not wrapper duplicates.
-            const key = c.text.toLowerCase();
-            if (seen.has(key)) continue;
-            seen.add(key);
-            unique.push(c);
-        }
-
-        if (!unique.length) {
-            return { headline: "N/A", description: "N/A", mode: "no_text" };
-        }
-
-        unique.sort((a, b) => {
-            if (Math.abs(a.top - b.top) > 6) return a.top - b.top;
-            return a.left - b.left;
-        });
-
-        let headlineObj = null;
-        let descriptionObj = null;
-        let mode = "fallback_image_order";
-
-        if (installAnchors.length) {
-            installAnchors.sort((a, b) => b.score - a.score);
-            const anchor = installAnchors[0];
-            mode = "install_anchor";
-
-            const belowInstall = unique
-                .filter(c => c.top >= anchor.bottom - 12)
-                .filter(c => c.top <= anchor.bottom + 360)
-                .filter(c => Math.abs(centerX(c) - centerX(anchor)) <= Math.max(420, anchor.width * 3))
-                .map(c => {
-                    const distance = Math.max(0, c.top - anchor.bottom);
-                    let score = 1000 - Math.min(distance, 1000);
-                    if (c.isHeadlineClass) score += 180;
-                    if (c.isDescriptionClass) score -= 90;
-                    if (c.fontWeight >= 600) score += 50;
-                    if (img) score -= Math.min(Math.abs(centerX(c) - centerX(img)), 500) / 8;
-                    return { ...c, score };
-                })
-                .sort((a, b) => {
-                    // Main rule: first usable visible text below install.
-                    if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
-                    return b.score - a.score;
-                });
-
-            headlineObj = belowInstall.length ? belowInstall[0] : null;
-        }
-
-        // Fallback when install anchor is not available: first usable text below/near the image.
-        if (!headlineObj) {
-            let pool = unique;
-            if (img) {
-                pool = unique.filter(c => c.top >= img.bottom - 30 || (c.top >= img.top - 20 && c.bottom <= img.bottom + 120));
+        const descriptionEl = document.querySelector(
+            'div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic'
+        );
+        if (descriptionEl && isVisible(descriptionEl)) {
+            const value = cleanText(descriptionEl.innerText || descriptionEl.textContent);
+            if (value && !value.includes("{{")) {
+                description = value;
             }
-
-            pool = pool.map(c => {
-                let score = 0;
-                if (img) score -= Math.min(Math.max(0, c.top - img.bottom), 600);
-                if (c.isHeadlineClass) score += 150;
-                if (c.isDescriptionClass) score -= 80;
-                if (c.fontWeight >= 600) score += 30;
-                return { ...c, score };
-            }).sort((a, b) => {
-                if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
-                return b.score - a.score;
-            });
-
-            headlineObj = pool.length ? pool[0] : unique[0];
         }
 
-        if (headlineObj) {
-            const belowHeadline = unique
-                .filter(c => c.text !== headlineObj.text)
-                .filter(c => c.top >= headlineObj.bottom - 10)
-                .filter(c => c.top <= headlineObj.bottom + 320)
-                .filter(c => Math.abs(centerX(c) - centerX(headlineObj)) <= Math.max(420, headlineObj.width * 2.5))
-                .map(c => {
-                    const distance = Math.max(0, c.top - headlineObj.bottom);
-                    let score = 1000 - Math.min(distance, 1000);
-                    if (c.isDescriptionClass) score += 180;
-                    if (c.isHeadlineClass) score -= 80;
-                    if (c.fontSize <= headlineObj.fontSize + 4) score += 30;
-                    return { ...c, score };
-                })
-                .sort((a, b) => {
-                    // Main rule: next usable visible text below headline.
-                    if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
-                    return b.score - a.score;
-                });
-
-            descriptionObj = belowHeadline.length ? belowHeadline[0] : null;
-        }
-
-        return {
-            headline: headlineObj ? headlineObj.text : "N/A",
-            description: descriptionObj ? descriptionObj.text : "N/A",
-            mode,
-            textCount: unique.length,
-            installCount: installAnchors.length
-        };
+        return { headline, description };
     }
     """
 
     def read_target(target):
         try:
-            data = target.evaluate(js, image_box or None)
+            data = target.evaluate(js)
             if not data:
                 return None
 
@@ -1685,7 +1442,10 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             description = clean_text(data.get("description"))
 
             if headline != "N/A" or description != "N/A":
-                return {"headline": headline, "description": description}
+                return {
+                    "headline": headline,
+                    "description": description,
+                }
         except Exception:
             return None
         return None
@@ -1693,29 +1453,22 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
-        # Strong fix: if the image target is known, ONLY read text from that same target.
-        if preferred_target is not None:
-            data = read_target(preferred_target)
-            if data:
-                return data
-            page.wait_for_timeout(1000)
-            continue
+        # Preserve the original order: main rendered creative first.
+        data = read_target(page)
+        if data:
+            return data
 
-        # Fallback for video/text-only ads where no image target exists.
-        try:
-            ranked_targets = get_ranked_non_video_targets(page)
-        except Exception:
-            ranked_targets = []
-
-        for _, target, _, _ in ranked_targets:
-            data = read_target(target)
+        # Then check each iframe in browser order, exactly like the working version.
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            data = read_target(frame)
             if data:
                 return data
 
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
-
 
 
 # =========================
