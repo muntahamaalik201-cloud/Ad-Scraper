@@ -39,7 +39,7 @@ CLAIM_AGENT_COL = 9
 CLAIM_TIME_COL = 10
 CLAIM_TOKEN_COL = 11
 CLAIM_STATUS_COL = 12
-CLAIM_TTL_MINUTES = 355
+CLAIM_TTL_MINUTES = 15
 RETRY_COOLDOWN_MINUTES = 5
 
 LOG_CACHE = []
@@ -299,11 +299,10 @@ def get_next_agent_task(direction, agent_name, run_id):
         if candidate["retry_cooldown_active"]:
             continue
 
-        if (
-            candidate["claim_agent"]
-            and candidate["claim_agent"] != agent_name
-            and not candidate["claim_expired"]
-        ):
+        # Skip every active claim, including this same agent.
+        # This prevents a timed-out bottom/top worker from reclaiming the same
+        # bad row forever. Claims become eligible again after CLAIM_TTL_MINUTES.
+        if candidate["claim_agent"] and not candidate["claim_expired"]:
             continue
 
         token = f"{agent_name}-{run_id}-{uuid.uuid4().hex[:10]}"
@@ -344,7 +343,8 @@ def mark_agent_retry(row_num, status="RETRY_NETWORK"):
     Mark a temporary 403/503/network failure without filling column F.
 
     Because column F stays empty, the row remains eligible for a later retry.
-    J is refreshed in Pakistan time and the picker applies a short cooldown.
+    The active claim is released, J is refreshed in Pakistan time, and
+    the picker applies a short cooldown before retrying the row.
     """
     sheet = get_sheet()
     now_text = pakistan_now().strftime("%Y-%m-%d %H:%M:%S")
@@ -354,8 +354,8 @@ def mark_agent_retry(row_num, status="RETRY_NETWORK"):
         _sheet_api_call(
             f"mark row {row_num} for retry",
             lambda: sheet.update(
-                f"J{row_num}:L{row_num}",
-                [[now_text, "", safe_status]],
+                f"I{row_num}:L{row_num}",
+                [["", now_text, "", safe_status]],
             ),
         )
         invalidate_snapshot_cache()
