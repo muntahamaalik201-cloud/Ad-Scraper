@@ -1,81 +1,168 @@
-"""Google Sheets helpers for the combined Google Ads scraper.
-
-Sheet layout used by the scraper:
-    A:G  -> advertiser/package/source URL/app link/time/media/time
-    H    -> Google Ads Transparency URL (input)
-    I:L  -> claim agent/time/token/status
-    M:N  -> headline/description
-    O    -> image URL
-    P    -> optional STOP flag
-"""
-
-from __future__ import annotations
-
-from datetime import datetime, timedelta
 import random
-import threading
+import re
 import time
 import uuid
-from typing import Any, Callable, Optional, TypeVar
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 import config
 
+# ==========================
+# TIMEZONE
+# ==========================
+PAKISTAN_TZ = ZoneInfo("Asia/Karachi")
+
+
+def pakistan_now():
+    """Return an aware datetime in Pakistan Standard Time (UTC+05:00)."""
+    return datetime.now(PAKISTAN_TZ)
+
 
 # ==========================
 # CACHE CONFIG
 # ==========================
 SHEET_CACHE = None
-SHEET_CACHE_TIME = 0.0
+SHEET_CACHE_TIME = 0
 SHEET_CACHE_TTL = 60
 
 SNAPSHOT_CACHE = None
-SNAPSHOT_TIME = 0.0
+SNAPSHOT_TIME = 0
 SNAPSHOT_TTL = 10
 
-_CACHE_LOCK = threading.RLock()
-
-
 # ==========================
-# COLUMN CONFIG (1-BASED)
+# COLUMNS
 # ==========================
-TRANSPARENCY_URL_COL = 8       # H
-CLAIM_AGENT_COL = 9            # I
-CLAIM_TIME_COL = 10            # J
-CLAIM_TOKEN_COL = 11           # K
-CLAIM_STATUS_COL = 12          # L
-HEADLINE_COL = 13              # M
-DESCRIPTION_COL = 14           # N
-IMAGE_URL_COL = 15             # O
-STOP_FLAG_COL = 16             # P (M:O are scraper output columns)
-MEDIA_VALUE_COL = 6            # F: video ID, "image", "text", ERROR, etc.
+CLAIM_AGENT_COL = 9
+CLAIM_TIME_COL = 10
+CLAIM_TOKEN_COL = 11
+CLAIM_STATUS_COL = 12
+CLAIM_TTL_MINUTES = 355
+RETRY_COOLDOWN_MINUTES = 5
 
-CLAIM_TTL_MINUTES = 15
-VERIFY_CLAIMS = True
-
-
-# ==========================
-# RETRY CONFIG
-# ==========================
-MAX_API_ATTEMPTS = 5
-BASE_RETRY_SECONDS = 2.0
-MAX_RETRY_SECONDS = 30.0
-RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
-
-T = TypeVar("T")
-
-
-# ==========================
-# LOGS (DISABLED)
-# ==========================
 LOG_CACHE = []
 WRITE_LOGS = False
 
+# Google Sheets/API errors worth retrying. A permanent permission error will
+# still fail after the bounded retry count instead of stopping the whole queue.
+RETRYABLE_API_STATUS_CODES = {403, 429, 500, 502, 503, 504}
+SHEET_API_MAX_ATTEMPTS = 6
 
-def flush_logs() -> None:
-    """Logs are disabled; clear any in-memory entries."""
+
+# ==========================
+# RETRY HELPERS
+# ==========================
+def _extract_api_status(error):
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status
+
+    match = re.search(r"\b(403|429|500|502|503|504)\b", str(error))
+    return int(match.group(1)) if match else None
+
+
+def _is_retryable_api_error(error):
+    status = _extract_api_status(error)
+    if status in RETRYABLE_API_STATUS_CODES:
+        return True
+
+    text = str(error).lower()
+    markers = (
+        "rate limit",
+        "quota",
+        "backend error",
+        "service unavailable",
+        "temporarily unavailable",
+        "internal error",
+        "connection reset",
+        "timed out",
+        "timeout",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _sheet_api_call(action_name, operation, attempts=SHEET_API_MAX_ATTEMPTS):
+    """Run a gspread operation with bounded exponential backoff."""
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except gspread.exceptions.APIError as error:
+            last_error = error
+            if not _is_retryable_api_error(error) or attempt >= attempts:
+                raise
+
+            status = _extract_api_status(error) or "API"
+            wait_seconds = min(60, 2 ** attempt) + random.uniform(0.2, 1.0)
+            print(
+                f"⚠ Google Sheets {status} during {action_name}; "
+                f"retry {attempt}/{attempts} in {wait_seconds:.1f}s"
+            )
+            time.sleep(wait_seconds)
+        except (TimeoutError, ConnectionError, OSError) as error:
+            last_error = error
+            if attempt >= attempts:
+                raise
+
+            wait_seconds = min(60, 2 ** attempt) + random.uniform(0.2, 1.0)
+            print(
+                f"⚠ Network error during {action_name}; "
+                f"retry {attempt}/{attempts} in {wait_seconds:.1f}s: {error}"
+            )
+            time.sleep(wait_seconds)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Failed Google Sheets operation: {action_name}")
+
+
+def invalidate_snapshot_cache():
+    global SNAPSHOT_CACHE, SNAPSHOT_TIME
+    SNAPSHOT_CACHE = None
+    SNAPSHOT_TIME = 0
+
+
+# ==========================
+# SHEET AUTH
+# ==========================
+def get_sheet():
+    global SHEET_CACHE, SHEET_CACHE_TIME
+
+    now = time.time()
+    if SHEET_CACHE is not None and (now - SHEET_CACHE_TIME) < SHEET_CACHE_TTL:
+        return SHEET_CACHE
+
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    creds = ServiceAccountCredentials.from_json_keyfile_name(
+        config.CREDENTIALS_FILE,
+        scope,
+    )
+    client = gspread.authorize(creds)
+
+    sheet = _sheet_api_call(
+        "open worksheet",
+        lambda: client.open_by_key(config.SPREADSHEET_ID).worksheet(
+            config.WORKSHEET_NAME
+        ),
+    )
+
+    SHEET_CACHE = sheet
+    SHEET_CACHE_TIME = now
+    return sheet
+
+
+# ==========================
+# LOGS DISABLED
+# ==========================
+def flush_logs():
     global LOG_CACHE
     LOG_CACHE = []
 
@@ -88,250 +175,108 @@ def add_log(
     video_id="",
     app_link="",
     message="",
-) -> None:
-    """Logs are disabled."""
-    return None
+):
+    return
 
 
 # ==========================
-# RETRY HELPERS
+# CLAIM/TIME HELPERS
 # ==========================
-def _http_status_code(error: Exception) -> Optional[int]:
-    response = getattr(error, "response", None)
-    status_code = getattr(response, "status_code", None)
-
-    if isinstance(status_code, int):
-        return status_code
-
-    text = str(error)
-    for code in sorted(RETRYABLE_HTTP_CODES):
-        if str(code) in text:
-            return code
-
-    return None
-
-
-def _retry_after_seconds(error: Exception) -> Optional[float]:
-    response = getattr(error, "response", None)
-    headers = getattr(response, "headers", None)
-    if not headers:
-        return None
-
-    try:
-        value = headers.get("Retry-After") or headers.get("retry-after")
-        if value is None:
-            return None
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_retryable_error(error: Exception) -> bool:
-    if isinstance(error, gspread.exceptions.APIError):
-        return _http_status_code(error) in RETRYABLE_HTTP_CODES
-
-    # Network/transport errors are normally transient. Avoid importing a specific
-    # HTTP stack because gspread versions can use different transports.
-    return isinstance(error, (TimeoutError, ConnectionError, OSError))
-
-
-def _run_with_retry(
-    operation: Callable[[], T],
-    operation_name: str,
-    attempts: int = MAX_API_ATTEMPTS,
-) -> T:
-    """Run a Sheets operation with exponential backoff, jitter, and Retry-After."""
-    last_error: Optional[Exception] = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            return operation()
-        except Exception as error:
-            last_error = error
-
-            if not _is_retryable_error(error) or attempt >= attempts:
-                raise
-
-            retry_after = _retry_after_seconds(error)
-            exponential = min(
-                MAX_RETRY_SECONDS,
-                BASE_RETRY_SECONDS * (2 ** (attempt - 1)),
-            )
-            jitter = random.uniform(0.0, 1.0)
-            wait_seconds = retry_after if retry_after is not None else exponential + jitter
-
-            code = _http_status_code(error)
-            code_text = f" HTTP {code}" if code else ""
-            print(
-                f"⚠ {operation_name} failed with{code_text}; "
-                f"retry {attempt}/{attempts} in {wait_seconds:.1f}s"
-            )
-            time.sleep(wait_seconds)
-
-    # Defensive fallback; the loop always returns or raises.
-    assert last_error is not None
-    raise last_error
-
-
-# ==========================
-# CACHE HELPERS
-# ==========================
-def invalidate_snapshot() -> None:
-    global SNAPSHOT_CACHE, SNAPSHOT_TIME
-    with _CACHE_LOCK:
-        SNAPSHOT_CACHE = None
-        SNAPSHOT_TIME = 0.0
-
-
-def invalidate_sheet_cache() -> None:
-    global SHEET_CACHE, SHEET_CACHE_TIME
-    with _CACHE_LOCK:
-        SHEET_CACHE = None
-        SHEET_CACHE_TIME = 0.0
-
-
-# ==========================
-# SHEET AUTH
-# ==========================
-def _open_sheet():
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        config.CREDENTIALS_FILE,
-        scope,
-    )
-    client = gspread.authorize(creds)
-    return client.open_by_key(config.SPREADSHEET_ID).worksheet(
-        config.WORKSHEET_NAME
-    )
-
-
-def get_sheet():
-    global SHEET_CACHE, SHEET_CACHE_TIME
-
-    now = time.time()
-    with _CACHE_LOCK:
-        if (
-            SHEET_CACHE is not None
-            and (now - SHEET_CACHE_TIME) < SHEET_CACHE_TTL
-        ):
-            return SHEET_CACHE
-
-        sheet = _run_with_retry(_open_sheet, "open worksheet")
-        SHEET_CACHE = sheet
-        SHEET_CACHE_TIME = time.time()
-        return sheet
-
-
-# ==========================
-# HELPERS
-# ==========================
-def _cell(row: list[str], column_number: int) -> str:
-    index = column_number - 1
-    return row[index].strip() if len(row) > index else ""
-
-
-def is_claim_expired(claim_time_text: str) -> bool:
+def _parse_claim_time(claim_time_text):
     if not claim_time_text:
-        return True
+        return None
 
     try:
-        claimed_at = datetime.strptime(claim_time_text, "%Y-%m-%d %H:%M:%S")
+        parsed = datetime.strptime(claim_time_text, "%Y-%m-%d %H:%M:%S")
+        return parsed.replace(tzinfo=PAKISTAN_TZ)
     except (TypeError, ValueError):
-        return True
+        return None
 
-    return datetime.now() - claimed_at > timedelta(minutes=CLAIM_TTL_MINUTES)
+
+def is_claim_expired(claim_time_text):
+    parsed = _parse_claim_time(claim_time_text)
+    if parsed is None:
+        return True
+    return pakistan_now() - parsed > timedelta(minutes=CLAIM_TTL_MINUTES)
+
+
+def is_retry_cooldown_active(claim_status, claim_time_text):
+    if not str(claim_status or "").upper().startswith("RETRY_"):
+        return False
+
+    parsed = _parse_claim_time(claim_time_text)
+    if parsed is None:
+        return False
+
+    return pakistan_now() - parsed < timedelta(minutes=RETRY_COOLDOWN_MINUTES)
 
 
 # ==========================
 # SNAPSHOT
 # ==========================
-def get_agent_rows_snapshot(force_refresh: bool = False):
-    """Read the worksheet once and return row-aware records."""
+def get_agent_rows_snapshot(force_refresh=False):
+    """One full sheet read, cached briefly to reduce API usage."""
     global SNAPSHOT_CACHE, SNAPSHOT_TIME
 
     now = time.time()
-    with _CACHE_LOCK:
-        if (
-            not force_refresh
-            and SNAPSHOT_CACHE is not None
-            and (now - SNAPSHOT_TIME) < SNAPSHOT_TTL
-        ):
-            return SNAPSHOT_CACHE
+    if (
+        not force_refresh
+        and SNAPSHOT_CACHE is not None
+        and (now - SNAPSHOT_TIME) < SNAPSHOT_TTL
+    ):
+        return SNAPSHOT_CACHE
 
     sheet = get_sheet()
-    values = _run_with_retry(sheet.get_all_values, "read worksheet snapshot")
+    values = _sheet_api_call("read full worksheet", sheet.get_all_values)
 
     rows = []
-    for index, row in enumerate(values[1:], start=2):
-        url = _cell(row, TRANSPARENCY_URL_COL)
-        media_value = _cell(row, MEDIA_VALUE_COL)
-        claim_agent = _cell(row, CLAIM_AGENT_COL)
-        claim_time = _cell(row, CLAIM_TIME_COL)
-        claim_token = _cell(row, CLAIM_TOKEN_COL)
-        claim_status = _cell(row, CLAIM_STATUS_COL)
-        stop_flag = _cell(row, STOP_FLAG_COL)
+    for idx in range(1, len(values)):
+        row = values[idx]
+        row_num = idx + 1
+
+        url = row[7].strip() if len(row) > 7 else ""
+        video_id = row[5].strip() if len(row) > 5 else ""
+        claim_agent = row[8].strip() if len(row) > 8 else ""
+        claim_time = row[9].strip() if len(row) > 9 else ""
+        claim_token = row[10].strip() if len(row) > 10 else ""
+        claim_status = row[11].strip() if len(row) > 11 else ""
 
         rows.append(
             {
-                "row_num": index,
+                "row_num": row_num,
                 "url": url,
-                "video_id": media_value,  # compatibility with existing callers
-                "media_value": media_value,
+                "video_id": video_id,
                 "claim_agent": claim_agent,
                 "claim_time": claim_time,
                 "claim_token": claim_token,
                 "claim_status": claim_status,
-                "stop_flag": stop_flag,
-                "processed": bool(media_value),
+                "stop_flag": "",
+                "processed": bool(video_id),
                 "claim_expired": is_claim_expired(claim_time),
+                "retry_cooldown_active": is_retry_cooldown_active(
+                    claim_status,
+                    claim_time,
+                ),
             }
         )
 
-    with _CACHE_LOCK:
-        SNAPSHOT_CACHE = rows
-        SNAPSHOT_TIME = time.time()
-
+    SNAPSHOT_CACHE = rows
+    SNAPSHOT_TIME = now
     return rows
 
 
 # ==========================
-# CLAIM / TASK PICKER
+# CORE TASK PICKER
 # ==========================
-def _write_claim(sheet, row_num: int, values: list[str]) -> None:
-    sheet.update(
-        range_name=f"I{row_num}:L{row_num}",
-        values=[values],
-    )
-
-
-def _verify_claim(sheet, row_num: int, token: str) -> bool:
-    values = sheet.get(f"I{row_num}:L{row_num}")
-    if not values or not values[0] or len(values[0]) < 4:
-        return False
-
-    current = values[0]
-    current_token = current[2].strip() if len(current) > 2 else ""
-    current_status = current[3].strip().upper() if len(current) > 3 else ""
-    return current_token == token and current_status == "CLAIMED"
-
-
-def get_next_agent_task(direction: str, agent_name: str, run_id: str):
-    """Claim the next unprocessed row from the top or bottom."""
+def get_next_agent_task(direction, agent_name, run_id):
     direction = direction.lower().strip()
     if direction not in {"top", "bottom"}:
-        raise ValueError("direction must be 'top' or 'bottom'")
+        raise ValueError("direction must be top or bottom")
 
     sheet = get_sheet()
+    rows = get_agent_rows_snapshot()
 
-    # Claims require a fresh cross-process view. A cached snapshot can assign a row
-    # that another process claimed seconds earlier.
-    rows = get_agent_rows_snapshot(force_refresh=True)
     unprocessed = [row for row in rows if row["url"] and not row["processed"]]
-
     if not unprocessed:
         return None
 
@@ -350,6 +295,10 @@ def get_next_agent_task(direction: str, agent_name: str, run_id: str):
         if candidate["stop_flag"].upper() == "STOP":
             return "COLLISION_STOP"
 
+        # A 403/503 row waits briefly while the agents continue with other rows.
+        if candidate["retry_cooldown_active"]:
+            continue
+
         if (
             candidate["claim_agent"]
             and candidate["claim_agent"] != agent_name
@@ -358,155 +307,124 @@ def get_next_agent_task(direction: str, agent_name: str, run_id: str):
             continue
 
         token = f"{agent_name}-{run_id}-{uuid.uuid4().hex[:10]}"
-        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        claim_values = [agent_name, now_text, token, "CLAIMED"]
+        now_text = pakistan_now().strftime("%Y-%m-%d %H:%M:%S")
 
-        _run_with_retry(
-            lambda: _write_claim(sheet, row_num, claim_values),
+        _sheet_api_call(
             f"claim row {row_num}",
+            lambda: sheet.update(
+                f"I{row_num}:L{row_num}",
+                [[agent_name, now_text, token, "CLAIMED"]],
+            ),
         )
 
-        if VERIFY_CLAIMS:
-            verified = _run_with_retry(
-                lambda: _verify_claim(sheet, row_num, token),
-                f"verify claim row {row_num}",
-            )
-            if not verified:
-                print(f"⚠ Claim collision detected on row {row_num}; trying another row")
-                invalidate_snapshot()
-                continue
-
-        invalidate_snapshot()
+        # Prevent this process from selecting its own stale cached row again.
+        invalidate_snapshot_cache()
         return row_num, candidate["url"]
 
     return None
 
 
-def mark_agent_done(row_num: int, agent_name: Optional[str] = None) -> None:
+# ==========================
+# STATUS UPDATES
+# ==========================
+def mark_agent_done(row_num, agent_name=None):
     sheet = get_sheet()
-    _run_with_retry(
-        lambda: sheet.update_cell(row_num, CLAIM_STATUS_COL, "DONE"),
-        f"mark row {row_num} done",
-    )
-    invalidate_snapshot()
+    try:
+        _sheet_api_call(
+            f"mark row {row_num} done",
+            lambda: sheet.update_cell(row_num, CLAIM_STATUS_COL, "DONE"),
+        )
+        invalidate_snapshot_cache()
+    except Exception as error:
+        print(f"Status update error for row {row_num}: {error}")
+
+
+def mark_agent_retry(row_num, status="RETRY_NETWORK"):
+    """
+    Mark a temporary 403/503/network failure without filling column F.
+
+    Because column F stays empty, the row remains eligible for a later retry.
+    J is refreshed in Pakistan time and the picker applies a short cooldown.
+    """
+    sheet = get_sheet()
+    now_text = pakistan_now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_status = str(status or "RETRY_NETWORK")[:100]
+
+    try:
+        _sheet_api_call(
+            f"mark row {row_num} for retry",
+            lambda: sheet.update(
+                f"J{row_num}:L{row_num}",
+                [[now_text, "", safe_status]],
+            ),
+        )
+        invalidate_snapshot_cache()
+    except Exception as error:
+        print(f"Retry-status update error for row {row_num}: {error}")
 
 
 # ==========================
-# WRITE HELPERS
+# BULK UPDATE HELPERS
 # ==========================
-def update_scrape_result(
-    row_index: int,
-    combined_data: list[Any],
-    headline: Any,
-    description: Any,
-    image_url: Any,
-) -> None:
-    """Write A:G and M:O in one Google Sheets batch request."""
-    if len(combined_data) != 7:
-        raise ValueError("combined_data must contain exactly 7 values for columns A:G")
-
+def update_combined_row(row_index, data):
     sheet = get_sheet()
-    payload = [
-        {
-            "range": f"A{row_index}:G{row_index}",
-            "values": [combined_data],
-        },
-        {
-            "range": f"M{row_index}:O{row_index}",
-            "values": [[headline, description, image_url]],
-        },
-    ]
-
-    def write_batch():
-        try:
-            return sheet.batch_update(payload, value_input_option="RAW")
-        except TypeError:
-            # Compatibility with older gspread releases.
-            return sheet.batch_update(payload)
-
-    _run_with_retry(write_batch, f"write scraper result row {row_index}")
-    invalidate_snapshot()
+    try:
+        _sheet_api_call(
+            f"update combined row {row_index}",
+            lambda: sheet.update(f"A{row_index}:G{row_index}", [data]),
+        )
+        invalidate_snapshot_cache()
+    except Exception as error:
+        print(f"Update error for row {row_index}: {error}")
+        raise
 
 
-# Compatibility helpers retained for scripts that still call them directly.
-def update_combined_row(row_index: int, data: list[Any]) -> None:
-    if len(data) != 7:
-        raise ValueError("data must contain exactly 7 values for columns A:G")
-
+def update_headline_and_description(row_index, headline, description):
     sheet = get_sheet()
-    _run_with_retry(
-        lambda: sheet.update(
-            range_name=f"A{row_index}:G{row_index}",
-            values=[data],
-        ),
-        f"update A:G row {row_index}",
-    )
-    invalidate_snapshot()
-
-
-def update_headline_and_description(
-    row_index: int,
-    headline: Any,
-    description: Any,
-) -> None:
-    sheet = get_sheet()
-    _run_with_retry(
-        lambda: sheet.update(
-            range_name=f"M{row_index}:N{row_index}",
-            values=[[headline, description]],
-        ),
-        f"update M:N row {row_index}",
-    )
-    invalidate_snapshot()
-
-
-def update_image_url(row_index: int, image_url: Any) -> None:
-    """Write the image URL to column O."""
-    sheet = get_sheet()
-    _run_with_retry(
-        lambda: sheet.update_cell(row_index, IMAGE_URL_COL, image_url),
-        f"update image URL row {row_index}",
-    )
-    invalidate_snapshot()
-
-
-def update_creative_details(
-    row_index: int,
-    headline: Any,
-    description: Any,
-    image_url: Any,
-) -> None:
-    """Write headline, description and image URL to M:O in one request."""
-    sheet = get_sheet()
-    _run_with_retry(
-        lambda: sheet.update(
-            range_name=f"M{row_index}:O{row_index}",
-            values=[[headline, description, image_url]],
-        ),
-        f"update M:O row {row_index}",
-    )
-    invalidate_snapshot()
+    try:
+        _sheet_api_call(
+            f"update text row {row_index}",
+            lambda: sheet.update(
+                f"M{row_index}:N{row_index}",
+                [[headline, description]],
+            ),
+        )
+    except Exception as error:
+        print(f"Headline/description update error for row {row_index}: {error}")
+        raise
 
 
 # ==========================
-# URL READ HELPERS
+# URL FETCH HELPERS
 # ==========================
-def get_url_rows_with_retry(only_unprocessed: bool = False):
-    """Return exact ``(sheet_row_number, URL)`` pairs without row shifting."""
+def get_url_rows_with_retry(unprocessed_only=False):
+    """Return real sheet row numbers, avoiding row-number drift when H has gaps."""
     rows = get_agent_rows_snapshot()
-    return [
-        (row["row_num"], row["url"])
-        for row in rows
-        if row["url"] and (not only_unprocessed or not row["processed"])
-    ]
+    result = []
+
+    for row in rows:
+        if not row["url"]:
+            continue
+        if unprocessed_only and row["processed"]:
+            continue
+        if unprocessed_only and row["retry_cooldown_active"]:
+            continue
+        result.append((row["row_num"], row["url"]))
+
+    return result
 
 
 def get_urls_with_retry():
-    """Compatibility API that preserves blank rows so enumerate(..., start=2) stays aligned."""
-    rows = get_agent_rows_snapshot()
-    return [row["url"] for row in rows]
+    """Compatibility helper used by older scraper entry points."""
+    return [url for _, url in get_url_rows_with_retry(unprocessed_only=False)]
 
 
-def count_unprocessed_rows() -> int:
+def count_unprocessed_rows():
     rows = get_agent_rows_snapshot()
-    return sum(1 for row in rows if row["url"] and not row["processed"])
+    return sum(
+        1
+        for row in rows
+        if row["url"]
+        and not row["processed"]
+        and not row["retry_cooldown_active"]
+    )
