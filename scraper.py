@@ -51,6 +51,7 @@ NAVIGATION_BACKOFF_SECONDS = (3, 7, 15, 30)
 CREATIVE_CLASSIFY_TIMEOUT_SECONDS = 8
 IMAGE_TEXT_GRACE_SECONDS = 2.5
 AMBIGUOUS_VIDEO_DETECTION_SECONDS = 8
+VIDEO_PROBE_BEFORE_IMAGE_SECONDS = 5
 PLAYWRIGHT_ACTION_TIMEOUT_MS = 4000
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".m3u8")
@@ -305,59 +306,92 @@ def scan_browser_performance_for_video(page):
 
 def click_possible_video_targets(page):
     """
-    Clicks possible video preview areas.
-    Avoids install buttons/app links.
+    Click a real play/video control first, including controls inside ad frames.
+    If the creative hides the control, click the largest visible creative iframe
+    once as a bounded fallback. This prevents video ads being saved as image.
     """
     selectors = [
         "video",
-        'button[aria-label*="Play"]',
-        'button[aria-label*="play"]',
-        'button[title*="Play"]',
-        'button[title*="play"]',
-        'div[aria-label*="Play"]',
-        'div[aria-label*="play"]',
-        '[role="button"][aria-label*="Play"]',
-        '[role="button"][aria-label*="play"]',
-        '[class*="play-button"]',
-        '[class*="playButton"]'
+        'button[aria-label*="Play" i]',
+        'button[title*="Play" i]',
+        'div[aria-label*="Play" i]',
+        '[role="button"][aria-label*="Play" i]',
+        '[class*="play-button" i]',
+        '[class*="playbutton" i]',
+        'img[src*="play" i]',
     ]
 
-    for sel in selectors:
+    targets = [page] + [frame for frame in page.frames if frame != page.main_frame]
+
+    for target in targets:
+        for sel in selectors:
+            try:
+                elements = target.locator(sel)
+                count = min(elements.count(), 10)
+
+                for i in range(count):
+                    el = elements.nth(i)
+                    if not el.is_visible():
+                        continue
+
+                    try:
+                        el.scroll_into_view_if_needed(timeout=1500)
+                        box = el.bounding_box(timeout=1500)
+                        if not box:
+                            continue
+
+                        # Play buttons can be small. Actual video surfaces must be larger.
+                        if sel == "video":
+                            if box["width"] < 120 or box["height"] < 80:
+                                continue
+                        elif box["width"] < 20 or box["height"] < 20:
+                            continue
+
+                        el.click(timeout=2000, force=True)
+                        page.wait_for_timeout(1000)
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    # Fallback for creatives where the play control is hidden inside a cross-origin iframe.
+    iframe_candidates = []
+    try:
+        iframes = page.locator("iframe")
+        for i in range(min(iframes.count(), 20)):
+            try:
+                iframe = iframes.nth(i)
+                if not iframe.is_visible():
+                    continue
+                box = iframe.bounding_box(timeout=1200)
+                if not box:
+                    continue
+                width = box.get("width", 0) or 0
+                height = box.get("height", 0) or 0
+                y = box.get("y", 99999) or 99999
+                if width < 160 or height < 100 or y < -100 or y > 1000:
+                    continue
+                iframe_candidates.append((width * height, iframe, box))
+            except Exception:
+                continue
+    except Exception:
+        iframe_candidates = []
+
+    if iframe_candidates:
+        iframe_candidates.sort(key=lambda item: item[0], reverse=True)
+        _, iframe, box = iframe_candidates[0]
         try:
-            elements = page.locator(sel)
-            count = elements.count()
-
-            for i in range(count):
-                el = elements.nth(i)
-
-                if not el.is_visible():
-                    continue
-
-                try:
-                    el.scroll_into_view_if_needed(timeout=2000)
-                    box = el.bounding_box()
-
-                    if not box:
-                        continue
-
-                    if box["width"] < 120 or box["height"] < 80:
-                        continue
-
-                    x = box["x"] + box["width"] / 2
-                    y = box["y"] + box["height"] / 2
-
-                    page.mouse.click(x, y)
-                    page.wait_for_timeout(1500)
-                    return True
-
-                except Exception:
-                    continue
-
+            page.mouse.click(
+                box["x"] + box["width"] / 2,
+                box["y"] + box["height"] / 2,
+            )
+            page.wait_for_timeout(1000)
+            return True
         except Exception:
-            continue
+            pass
 
     return False
-
 
 def wait_for_video_id(page, captured, max_seconds=20):
     waited = 0
@@ -374,6 +408,25 @@ def wait_for_video_id(page, captured, max_seconds=20):
         waited += 0.5
 
     return "N/A"
+
+
+
+def probe_video_before_image(page, captured, max_seconds=VIDEO_PROBE_BEFORE_IMAGE_SECONDS):
+    """
+    One bounded video probe before a static creative is labelled ``image``.
+    It preserves fast image handling but gives video ads enough time to start
+    and expose their real video ID.
+    """
+    video_id = get_immediate_video_id(page, captured)
+    if video_id != "N/A":
+        return video_id
+
+    click_possible_video_targets(page)
+    video_id = wait_for_video_id(page, captured, max_seconds=max_seconds)
+    if video_id != "N/A":
+        return video_id
+
+    return scan_browser_performance_for_video(page)
 
 
 class TransientHTTPError(RuntimeError):
@@ -1551,16 +1604,18 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
     """
     Return (kind, video_id, headline, description).
 
-    Priority is exactly:
+    Priority remains:
       1. Real video ID
       2. Visible text ad
       3. Static image ad
 
-    A static image is saved after a short grace period, so image rows stay fast
-    while late-loading text ads are not incorrectly labeled as image.
+    Before returning ``image``, run one bounded video-start probe. This is the
+    only behavioral correction: text and image handling remain unchanged, while
+    video creatives write their real ID in column F instead of ``image``.
     """
     deadline = time.time() + max_wait_seconds
     first_image_seen_at = None
+    video_probe_done = False
     last_headline = "N/A"
     last_description = "N/A"
 
@@ -1577,29 +1632,39 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
 
         last_headline, last_description = headline, description
         image_like = has_visible_image_creative(page)
-        video_hint = has_video_hint(page)
 
-        if image_like and not video_hint:
+        if image_like:
             if first_image_seen_at is None:
                 first_image_seen_at = time.time()
             elif time.time() - first_image_seen_at >= IMAGE_TEXT_GRACE_SECONDS:
+                if not video_probe_done:
+                    video_probe_done = True
+                    video_id = probe_video_before_image(page, captured)
+                    if video_id != "N/A":
+                        return "video", video_id, "N/A", "N/A"
+
+                    # A click can reveal late text, so let text win once more.
+                    text_data = extract_text_ad_details_once(page)
+                    headline = clean_text(text_data.get("headline"))
+                    description = clean_text(text_data.get("description"))
+                    if is_valid_text_ad(headline, description):
+                        return "text", "N/A", headline, description
+
                 return "image", "N/A", "N/A", "N/A"
         else:
             first_image_seen_at = None
 
         page.wait_for_timeout(500)
 
-    # Ambiguous video-looking creatives get one bounded video attempt.
-    if has_video_hint(page):
-        video_id = detect_video_id(
-            page,
-            captured,
-            max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS,
-        )
-        if video_id != "N/A":
-            return "video", video_id, "N/A", "N/A"
+    # Ambiguous non-image creatives retain the existing bounded video logic.
+    video_id = detect_video_id(
+        page,
+        captured,
+        max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS,
+    )
+    if video_id != "N/A":
+        return "video", video_id, "N/A", "N/A"
 
-    # Final text probe wins over image.
     text_data = extract_text_ad_details_once(page)
     headline = clean_text(text_data.get("headline"))
     description = clean_text(text_data.get("description"))
@@ -1607,10 +1672,13 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
         return "text", "N/A", headline, description
 
     if has_visible_image_creative(page):
+        if not video_probe_done:
+            video_id = probe_video_before_image(page, captured)
+            if video_id != "N/A":
+                return "video", video_id, "N/A", "N/A"
         return "image", "N/A", "N/A", "N/A"
 
     return "unknown", "N/A", last_headline, last_description
-
 
 def save_fast_image_ad(page, row_num, url, advertiser):
     """
