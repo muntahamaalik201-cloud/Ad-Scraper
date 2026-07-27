@@ -28,29 +28,22 @@ INSTALL_SELECTORS = [
 ]
 
 
-def safe_update_combined_row(row_num, data):
-    """
-    Thread-safe Google Sheet row update.
-    Browser scraping runs parallel, but sheet writing is protected.
-    """
+def safe_update_scrape_result(
+    row_num,
+    combined_data,
+    headline,
+    description,
+    image_url,
+):
+    """Write A:G and M:O atomically through the shared Sheets retry layer."""
     with SHEET_LOCK:
-        sheets.update_combined_row(row_num, data)
-
-
-def safe_update_headline_desc(row_num, headline, description):
-    """
-    Thread-safe Google Sheet row update for Headline and Description in cols M and N.
-    """
-    with SHEET_LOCK:
-        sheets.update_headline_and_description(row_num, headline, description)
-
-
-def safe_update_image_url(row_num, image_url):
-    """
-    Thread-safe Google Sheet row update for Image URL in column O.
-    """
-    with SHEET_LOCK:
-        sheets.update_image_url(row_num, image_url)
+        sheets.update_scrape_result(
+            row_index=row_num,
+            combined_data=combined_data,
+            headline=headline,
+            description=description,
+            image_url=image_url,
+        )
 
 
 def safe_add_log(row_number, status, log_type, url="", video_id="", app_link="", message=""):
@@ -2526,9 +2519,9 @@ def save_scrape_result(
     description = clean_text(description)
     image_url = clean_text(image_url)
 
-    safe_update_combined_row(
-        row_num,
-        [
+    safe_update_scrape_result(
+        row_num=row_num,
+        combined_data=[
             clean_text(advertiser),
             package_name,
             transparency_url,
@@ -2537,9 +2530,10 @@ def save_scrape_result(
             media_value,
             event_time,
         ],
+        headline=headline,
+        description=description,
+        image_url=image_url,
     )
-    safe_update_headline_desc(row_num, headline, description)
-    safe_update_image_url(row_num, image_url)
     safe_add_log(
         row_number=row_num,
         status=status,
@@ -2823,12 +2817,11 @@ def scrape_single_url(url_row):
 
 
 def run_parallel_combined_scraper(max_workers=2):
-    urls = sheets.get_urls_with_retry()
-
+    # Exact row numbers prevent blank input rows from shifting output writes.
     url_rows = [
-        (i + 2, u.strip())
-        for i, u in enumerate(urls)
-        if u and u.strip()
+        (row_num, url.strip())
+        for row_num, url in sheets.get_url_rows_with_retry(only_unprocessed=False)
+        if url and url.strip()
     ]
 
     if not url_rows:
