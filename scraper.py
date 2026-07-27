@@ -48,9 +48,10 @@ PAKISTAN_TZ = ZoneInfo("Asia/Karachi")
 TRANSIENT_HTTP_STATUSES = {403, 429, 500, 502, 503, 504}
 NAVIGATION_MAX_ATTEMPTS = 4
 NAVIGATION_BACKOFF_SECONDS = (3, 7, 15, 30)
-FAST_TEXT_WAIT_SECONDS = 3
-FAST_IMAGE_LINK_WAIT_SECONDS = 0
-AMBIGUOUS_VIDEO_DETECTION_SECONDS = 9
+CREATIVE_CLASSIFY_TIMEOUT_SECONDS = 8
+IMAGE_TEXT_GRACE_SECONDS = 2.5
+AMBIGUOUS_VIDEO_DETECTION_SECONDS = 8
+PLAYWRIGHT_ACTION_TIMEOUT_MS = 4000
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".m3u8")
 
@@ -1348,75 +1349,136 @@ def get_ranked_non_video_targets(page):
     return ranked
 
 
-def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
+def extract_text_ad_details_once(page):
     """
-    Extracts headline and description for non-video ads.
-    - Prefers visible elements from the active creative (main DOM).
-    - Uses specific selectors: <div role="link">, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic
-    - Falls back to iframe if necessary.
-    - Relaxed visibility check to allow offscreen or special-language creatives (e.g., Arabic).
+    One fast text-ad probe.
+
+    It checks the active creative frames first and combines the selector logic
+    from the previous working scraper. A large image/logo by itself never makes
+    a row a text ad; visible headline/description text is required.
     """
     js = r"""
     () => {
-        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+        const clean = (value) => String(value || '')
+            .replace(/\n/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
 
-        // RELAXED visibility: ignore offscreen top/bottom/left/right but still require positive width/height
-        const isVisible = (el) => {
+        const visible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
             return rect.width > 0 && rect.height > 0 &&
-                   style.visibility !== 'hidden' &&
                    style.display !== 'none' &&
+                   style.visibility !== 'hidden' &&
                    style.opacity !== '0';
         };
 
-        let headline = "N/A";
-        let description = "N/A";
+        const bad = (text) => {
+            const t = clean(text).toLowerCase();
+            if (!t || t.length < 2 || t.includes('{{')) return true;
+            return [
+                'ads transparency center', 'ads transparency centre',
+                'see more ads', 'report this ad', 'sign in', 'last shown'
+            ].some(x => t === x || t.startsWith(x));
+        };
 
-        // 1️⃣ Main visible creative first
-        const headlineEl = document.querySelector('div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
-        if (headlineEl && isVisible(headlineEl)) {
-            headline = cleanText(headlineEl.innerText || headlineEl.textContent);
-        }
+        const firstText = (selectors, minLen, maxLen) => {
+            for (const selector of selectors) {
+                for (const el of document.querySelectorAll(selector)) {
+                    if (!visible(el)) continue;
+                    const text = clean(el.innerText || el.textContent || '');
+                    if (text.length < minLen || text.length > maxLen || bad(text)) continue;
+                    return text;
+                }
+            }
+            return 'N/A';
+        };
 
-        const descriptionEl = document.querySelector('div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
-        if (descriptionEl && isVisible(descriptionEl)) {
-            description = cleanText(descriptionEl.innerText || descriptionEl.textContent);
-        }
+        let headline = firstText([
+            '[class*="-e-15"]',
+            '[class*="headline"]',
+            '[aria-label*="Headline"]',
+            '[aria-label*="headline"]',
+            'div[role="link"] span',
+            'div.cS4Vcb-vnv8ic'
+        ], 3, 180);
 
-        return { headline, description };
+        let description = firstText([
+            '[class*="-e-67"]',
+            '[class*="long-description"]',
+            '[class*="description"]',
+            '[aria-label*="Description"]',
+            '[aria-label*="description"]',
+            'div.HFTpmd-WsjYwc-hgDUwe'
+        ], 8, 320);
+
+        if (description === headline) description = 'N/A';
+
+        let score = 0;
+        if (headline !== 'N/A') score += 120;
+        if (description !== 'N/A') score += 100;
+
+        return {headline, description, score};
     }
     """
 
-    def read_target(target):
+    candidates = []
+
+    # Prefer visible creative iframes. Hidden/stale frames often contain old
+    # template text and were a source of wrong classifications.
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
         try:
-            data = target.evaluate(js)
-            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
-                return data
-        except Exception:
-            return None
-        return None
-
-    start_time = time.time()
-
-    while time.time() - start_time < max_wait_seconds:
-        # 1) Check main page DOM first (active visible creative)
-        data = read_target(page)
-        if data:
-            return data
-
-        # 2) Fallback: check iframes only if main DOM didn't yield headline/description
-        for frame in page.frames:
-            if frame == page.main_frame:
+            box = _frame_parent_box(frame)
+            if not box:
                 continue
-            data = read_target(frame)
-            if data:
-                return data
+            if (box.get("width", 0) or 0) < 100 or (box.get("height", 0) or 0) < 60:
+                continue
+            if (box.get("y", 99999) or 99999) > 1400:
+                continue
+            result = frame.evaluate(js)
+            if result and result.get("score", 0) > 0:
+                area_bonus = min(((box.get("width", 0) or 0) * (box.get("height", 0) or 0)) / 10000, 50)
+                candidates.append((result.get("score", 0) + area_bonus, result))
+        except Exception:
+            continue
 
-        page.wait_for_timeout(1000)
+    # Main page is only a fallback because it also contains Google page chrome.
+    try:
+        result = page.evaluate(js)
+        if result and result.get("score", 0) > 0:
+            candidates.append((result.get("score", 0) - 40, result))
+    except Exception:
+        pass
 
-    return {"headline": "N/A", "description": "N/A"}
+    if not candidates:
+        return {"headline": "N/A", "description": "N/A"}
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best = candidates[0][1]
+    return {
+        "headline": clean_text(best.get("headline")),
+        "description": clean_text(best.get("description")),
+    }
+
+
+def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
+    """Poll the fast text probe for a bounded amount of time."""
+    deadline = time.time() + max(0, max_wait_seconds)
+
+    while True:
+        result = extract_text_ad_details_once(page)
+        if is_valid_text_ad(result.get("headline"), result.get("description")):
+            return result
+
+        if time.time() >= deadline:
+            return {"headline": "N/A", "description": "N/A"}
+
+        page.wait_for_timeout(500)
+
+
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
 # =========================
@@ -1430,53 +1492,53 @@ def is_valid_text_ad(headline, description):
 
 def has_visible_image_creative(page):
     """
-    Detects likely image/display creative for non-video ads.
-    Used only after video detection returns N/A.
+    Detect a real static image creative, not Google shell SVGs or small app icons.
+
+    Only large raster/canvas/background artwork inside visible creative frames
+    counts. Text extraction always gets priority before this result is used.
     """
     js = r"""
     () => {
-        const isVisible = (el) => {
+        const visible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            return (
-                rect.width >= 120 &&
-                rect.height >= 80 &&
-                rect.bottom > 0 &&
-                rect.right > 0 &&
-                rect.top < window.innerHeight &&
-                rect.left < window.innerWidth &&
-                style.visibility !== 'hidden' &&
-                style.display !== 'none' &&
-                style.opacity !== '0'
-            );
+            return rect.width >= 200 && rect.height >= 100 &&
+                   (rect.width * rect.height) >= 40000 &&
+                   style.display !== 'none' &&
+                   style.visibility !== 'hidden' &&
+                   style.opacity !== '0';
         };
 
-        const imageLike = Array.from(document.querySelectorAll('img, picture, canvas, svg')).some(el => {
+        for (const el of document.querySelectorAll('img, picture, canvas')) {
+            if (!visible(el)) continue;
             const src = String(el.getAttribute('src') || '').toLowerCase();
             const alt = String(el.getAttribute('alt') || '').toLowerCase();
-            if (src.includes('googlelogo') || alt.includes('google')) return false;
-            return isVisible(el);
-        });
+            if (src.includes('googlelogo') || alt.includes('google')) continue;
+            return true;
+        }
 
-        if (imageLike) return true;
-
-        return Array.from(document.querySelectorAll('*')).some(el => {
-            if (!isVisible(el)) return false;
+        for (const el of document.querySelectorAll('div, a, section')) {
+            if (!visible(el)) continue;
             const bg = window.getComputedStyle(el).backgroundImage || '';
-            return bg && bg !== 'none' && bg.includes('url(');
-        });
+            if (bg && bg !== 'none' && bg.includes('url(') && !bg.toLowerCase().includes('googlelogo')) {
+                return true;
+            }
+        }
+
+        return false;
     }
     """
 
-    try:
-        if page.evaluate(js):
-            return True
-    except Exception:
-        pass
-
     for frame in page.frames:
+        if frame == page.main_frame:
+            continue
         try:
+            box = _frame_parent_box(frame)
+            if not box:
+                continue
+            if (box.get("width", 0) or 0) < 120 or (box.get("height", 0) or 0) < 70:
+                continue
             if frame.evaluate(js):
                 return True
         except Exception:
@@ -1485,104 +1547,162 @@ def has_visible_image_creative(page):
     return False
 
 
+def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT_SECONDS):
+    """
+    Return (kind, video_id, headline, description).
+
+    Priority is exactly:
+      1. Real video ID
+      2. Visible text ad
+      3. Static image ad
+
+    A static image is saved after a short grace period, so image rows stay fast
+    while late-loading text ads are not incorrectly labeled as image.
+    """
+    deadline = time.time() + max_wait_seconds
+    first_image_seen_at = None
+    last_headline = "N/A"
+    last_description = "N/A"
+
+    while time.time() < deadline:
+        video_id = get_immediate_video_id(page, captured)
+        if video_id != "N/A":
+            return "video", video_id, "N/A", "N/A"
+
+        text_data = extract_text_ad_details_once(page)
+        headline = clean_text(text_data.get("headline"))
+        description = clean_text(text_data.get("description"))
+        if is_valid_text_ad(headline, description):
+            return "text", "N/A", headline, description
+
+        last_headline, last_description = headline, description
+        image_like = has_visible_image_creative(page)
+        video_hint = has_video_hint(page)
+
+        if image_like and not video_hint:
+            if first_image_seen_at is None:
+                first_image_seen_at = time.time()
+            elif time.time() - first_image_seen_at >= IMAGE_TEXT_GRACE_SECONDS:
+                return "image", "N/A", "N/A", "N/A"
+        else:
+            first_image_seen_at = None
+
+        page.wait_for_timeout(500)
+
+    # Ambiguous video-looking creatives get one bounded video attempt.
+    if has_video_hint(page):
+        video_id = detect_video_id(
+            page,
+            captured,
+            max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS,
+        )
+        if video_id != "N/A":
+            return "video", video_id, "N/A", "N/A"
+
+    # Final text probe wins over image.
+    text_data = extract_text_ad_details_once(page)
+    headline = clean_text(text_data.get("headline"))
+    description = clean_text(text_data.get("description"))
+    if is_valid_text_ad(headline, description):
+        return "text", "N/A", headline, description
+
+    if has_visible_image_creative(page):
+        return "image", "N/A", "N/A", "N/A"
+
+    return "unknown", "N/A", last_headline, last_description
+
+
 def save_fast_image_ad(page, row_num, url, advertiser):
     """
-    Save a confirmed static image ad immediately.
+    Save an image row without processing its app link, package, or ad text.
 
-    It performs only zero-wait visible-link checks. It intentionally skips
-    headline polling, package-page scanning and long video waits.
+    This is intentionally minimal: column F receives only ``image`` and the
+    worker immediately moves to the next row.
     """
     process_time = get_exact_time()
-
-    app_link = extract_visible_install_link(page)
-    if app_link == "N/A":
-        app_link = extract_install_link_by_precise_js(page)
-
-    package_name = extract_package_name(app_link)
-    if package_name == "N/A":
-        app_link = "N/A"
-        status = "FAST_IMAGE_SAVED_NO_PACKAGE"
-        message = "Static image ad saved immediately; package lookup skipped"
-    else:
-        status = "SUCCESS"
-        message = "Static image ad saved immediately from visible install link"
-
     data = [
         advertiser,
-        package_name,
+        "N/A",
         url,
-        app_link,
+        "N/A",
         process_time,
         "image",
-        process_time
+        process_time,
     ]
 
     safe_update_combined_row(row_num, data)
     safe_update_headline_desc(row_num, "N/A", "N/A")
     safe_add_log(
         row_number=row_num,
-        status=status,
+        status="SUCCESS",
         log_type="FAST_IMAGE_AD",
         url=url,
         video_id="image",
-        app_link=app_link,
-        message=message
+        app_link="N/A",
+        message="Static image ad classified and saved without further processing",
     )
-    print(f"✅ Row {row_num}: static IMAGE ad saved by fast path")
+    print(f"✅ Row {row_num}: saved IMAGE ad without extra processing")
 
 
 def scrape_single_url(url_row):
     row_num, url = url_row
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-web-security",
-            ]
-        )
+        browser = None
+        context = None
+        page = None
 
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            service_workers="block",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        )
-
-        # Fonts are not needed for extraction and can slow the creative load.
         try:
-            context.route(
-                "**/*",
-                lambda route: route.abort()
-                if route.request.resource_type == "font"
-                else route.continue_()
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-web-security",
+                ],
             )
-        except Exception:
-            pass
 
-        page = context.new_page()
-        captured = {"video_id": "N/A"}
+            context = browser.new_context(
+                viewport={"width": 1366, "height": 768},
+                service_workers="block",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            context.set_default_timeout(PLAYWRIGHT_ACTION_TIMEOUT_MS)
+            context.set_default_navigation_timeout(60000)
 
-        def handle_response(response):
+            # Fonts are unnecessary for extraction and can materially delay ads.
             try:
-                if not is_real_video_response(response):
-                    return
-
-                video_id = extract_video_id_from_url(response.url)
-                if video_id and captured["video_id"] == "N/A":
-                    captured["video_id"] = video_id
+                context.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type == "font"
+                    else route.continue_(),
+                )
             except Exception:
                 pass
 
-        page.on("response", handle_response)
+            page = context.new_page()
+            page.set_default_timeout(PLAYWRIGHT_ACTION_TIMEOUT_MS)
+            page.set_default_navigation_timeout(60000)
+            captured = {"video_id": "N/A"}
 
-        try:
+            def handle_response(response):
+                try:
+                    if not is_real_video_response(response):
+                        return
+                    found_id = extract_video_id_from_url(response.url)
+                    if found_id and captured["video_id"] == "N/A":
+                        captured["video_id"] = found_id
+                except Exception:
+                    pass
+
+            page.on("response", handle_response)
+
             if "region=" not in url:
                 separator = "&" if "?" in url else "?"
                 url = f"{url}{separator}region=anywhere"
@@ -1593,60 +1713,31 @@ def scrape_single_url(url_row):
                 status="STARTED",
                 log_type="COMBINED",
                 url=url,
-                message="Started combined video/text/image ad extraction"
+                message="Started combined video/text/image ad extraction",
             )
 
             navigate_with_retry(page, url, row_num)
             advertiser = extract_advertiser_from_page(page)
 
-            # First perform only cheap checks. Static images can exit here.
-            video_id = get_immediate_video_id(page, captured)
-            text_data = {"headline": "N/A", "description": "N/A"}
-            headline = "N/A"
-            description = "N/A"
-            has_text = False
-            is_image_like = False
-            video_hint = has_video_hint(page)
-
-            if video_id == "N/A":
-                text_data = wait_and_extract_text_ad_details(
-                    page,
-                    max_wait_seconds=FAST_TEXT_WAIT_SECONDS
-                )
-                headline = clean_text(text_data.get("headline"))
-                description = clean_text(text_data.get("description"))
-                has_text = is_valid_text_ad(headline, description)
-                is_image_like = has_visible_image_creative(page)
-                video_hint = has_video_hint(page)
-
-                # Strong static-image case: do not run long video/link/package logic.
-                if is_image_like and not has_text and not video_hint:
-                    print(f"🖼 Row {row_num}: confirmed static image; using fast path")
-                    save_fast_image_ad(page, row_num, url, advertiser)
-                    return
-
-                # Text without any video hint is already classified. Only ambiguous
-                # or video-looking creatives get the bounded video detector.
-                if not has_text or video_hint:
-                    video_id = detect_video_id(
-                        page,
-                        captured,
-                        max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS
-                    )
-
-            video_time = get_exact_time()
+            kind, video_id, headline, description = classify_creative(page, captured)
 
             # =========================
-            # VIDEO AD PATH
+            # IMAGE AD: no extra processing
             # =========================
-            if video_id != "N/A":
+            if kind == "image":
+                save_fast_image_ad(page, row_num, url, advertiser)
+                return
+
+            # =========================
+            # VIDEO AD: column F = real video ID
+            # =========================
+            if kind == "video" and video_id != "N/A":
                 print(f"🎬 Row {row_num}: video ID found: {video_id}")
-
-                app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
+                app_link = wait_and_extract_install_link(page, max_wait_seconds=25)
                 app_link_time = get_exact_time()
-                headline, description = wait_and_extract_headline_description(
+                video_headline, video_description = wait_and_extract_headline_description(
                     page,
-                    max_wait_seconds=15
+                    max_wait_seconds=10,
                 )
 
                 if app_link == "N/A":
@@ -1664,11 +1755,14 @@ def scrape_single_url(url_row):
                     app_link,
                     app_link_time,
                     video_id,
-                    video_time
+                    get_exact_time(),
                 ]
-
                 safe_update_combined_row(row_num, data)
-                safe_update_headline_desc(row_num, headline, description)
+                safe_update_headline_desc(
+                    row_num,
+                    clean_text(video_headline),
+                    clean_text(video_description),
+                )
                 safe_add_log(
                     row_number=row_num,
                     status=status,
@@ -1676,115 +1770,102 @@ def scrape_single_url(url_row):
                     url=url,
                     video_id=video_id,
                     app_link=app_link,
-                    message=message
+                    message=message,
                 )
                 print(f"✅ Row {row_num}: saved VIDEO ad")
                 return
 
             # =========================
-            # NON-VIDEO PATH
+            # TEXT AD: column F = text
             # =========================
-            if headline == "N/A" and description == "N/A":
-                text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=3)
-                headline = clean_text(text_data.get("headline"))
-                description = clean_text(text_data.get("description"))
-                has_text = is_valid_text_ad(headline, description)
+            if kind == "text" and is_valid_text_ad(headline, description):
+                print(f"📄 Row {row_num}: text ad found -> {headline}")
+                process_time = get_exact_time()
 
-            if not is_image_like:
-                is_image_like = has_visible_image_creative(page)
-
-            # Ambiguous image with a play-like decoration: after bounded video
-            # detection failed, save it as image without expensive processing.
-            if not has_text and is_image_like:
-                save_fast_image_ad(page, row_num, url, advertiser)
-                return
-
-            process_time = get_exact_time()
-
-            if not has_text:
-                data = [
-                    advertiser,
-                    "N/A",
-                    url,
-                    "N/A",
-                    process_time,
-                    "N/A",
-                    process_time
-                ]
-                safe_update_combined_row(row_num, data)
-                safe_update_headline_desc(row_num, "N/A", "N/A")
-                safe_add_log(
-                    row_number=row_num,
-                    status="NO_VIDEO_NO_TEXT_IMAGE",
-                    log_type="COMBINED",
-                    url=url,
-                    video_id="N/A",
-                    app_link="N/A",
-                    message="No video ID and no valid text/image creative found"
+                visible_app_link = wait_and_extract_install_link(
+                    page,
+                    max_wait_seconds=5,
                 )
-                print(f"⏭ Row {row_num}: no supported creative found")
-                return
+                visible_package = extract_package_name(visible_app_link)
 
-            print(f"📄 Row {row_num}: text ad found -> {headline}")
-
-            # Text ads retain package resolution, but with a shorter visible-link wait.
-            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=5)
-            visible_package = extract_package_name(visible_app_link)
-
-            if visible_package != "N/A":
-                package_name = visible_package
-                app_link = visible_app_link
-                match_score = 1.0
-                status = "SUCCESS"
-                message = "Text ad package extracted from visible install link"
-            else:
-                all_found_packages = extract_package_from_page(page)
-                package_name, match_score = get_best_matching_package(
-                    headline,
-                    description,
-                    all_found_packages
-                )
-
-                if package_name:
-                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                if visible_package != "N/A":
+                    package_name = visible_package
+                    app_link = visible_app_link
                     status = "SUCCESS"
-                    message = f"Text ad package strictly matched with score {match_score}"
+                    message = "Text ad package extracted from visible install link"
                 else:
-                    package_name = "N/A"
-                    app_link = "N/A"
-                    status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = (
-                        "Text ad found, but package score below 0.76. "
-                        f"Best score={match_score}"
+                    all_found_packages = extract_package_from_page(page)
+                    package_name, match_score = get_best_matching_package(
+                        headline,
+                        description,
+                        all_found_packages,
                     )
 
+                    if package_name:
+                        app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                        status = "SUCCESS"
+                        message = f"Text ad package strictly matched with score {match_score}"
+                    else:
+                        package_name = "N/A"
+                        app_link = "N/A"
+                        status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+                        message = (
+                            "Text ad found, but package score below 0.76. "
+                            f"Best score={match_score}"
+                        )
+
+                data = [
+                    advertiser,
+                    package_name,
+                    url,
+                    app_link,
+                    process_time,
+                    "text",
+                    process_time,
+                ]
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, headline, description)
+                safe_add_log(
+                    row_number=row_num,
+                    status=status,
+                    log_type="TEXT_AD",
+                    url=url,
+                    video_id="text",
+                    app_link=app_link,
+                    message=message,
+                )
+                print(f"✅ Row {row_num}: saved TEXT ad")
+                return
+
+            # No supported creative could be verified. Keep the old N/A behavior.
+            process_time = get_exact_time()
             data = [
                 advertiser,
-                package_name,
+                "N/A",
                 url,
-                app_link,
+                "N/A",
                 process_time,
-                "text",
-                process_time
+                "N/A",
+                process_time,
             ]
             safe_update_combined_row(row_num, data)
-            safe_update_headline_desc(row_num, headline, description)
+            safe_update_headline_desc(row_num, "N/A", "N/A")
             safe_add_log(
                 row_number=row_num,
-                status=status,
-                log_type="TEXT_AD",
+                status="NO_VIDEO_NO_TEXT_IMAGE",
+                log_type="COMBINED",
                 url=url,
-                video_id="text",
-                app_link=app_link,
-                message=message
+                video_id="N/A",
+                app_link="N/A",
+                message="No video ID and no valid text/image creative found",
             )
-            print(f"✅ Row {row_num}: saved TEXT ad")
+            print(f"⏭ Row {row_num}: no supported creative found")
 
-        except TransientHTTPError as e:
-            status_code = e.status or "NETWORK"
+        except TransientHTTPError as error:
+            status_code = error.status or "NETWORK"
             retry_status = f"RETRY_{status_code}"
             print(
-                f"⚠️ Row {row_num}: {e}. Leaving row unprocessed and continuing."
+                f"⚠️ Row {row_num}: {error}. Leaving row unprocessed and continuing."
             )
             safe_mark_agent_retry(row_num, retry_status)
             safe_add_log(
@@ -1792,55 +1873,41 @@ def scrape_single_url(url_row):
                 status=retry_status,
                 log_type="TRANSIENT_ERROR",
                 url=url,
-                message=str(e)
+                message=str(error),
             )
-            return
 
-        except Exception as e:
+        except Exception as error:
             error_time = get_exact_time()
-            print(f"❌ Row {row_num} error at {error_time}: {e}")
+            print(f"❌ Row {row_num} error at {error_time}: {error}")
 
-            # Non-transient errors are recorded, but this worker never terminates
-            # the remaining queue.
-            try:
-                data = [
-                    "",
-                    "N/A",
-                    url,
-                    "ERROR",
-                    error_time,
-                    "ERROR",
-                    error_time
-                ]
-                safe_update_combined_row(row_num, data)
-                safe_update_headline_desc(row_num, "N/A", "N/A")
-            except Exception:
-                pass
-
-            try:
-                safe_add_log(
-                    row_number=row_num,
-                    status="ERROR",
-                    log_type="COMBINED",
-                    url=url,
-                    message=str(e)
-                )
-            except Exception:
-                pass
+            # Do not write ERROR into column F. Leave it empty so another pass
+            # can retry the row, while the current top/bottom agent continues.
+            safe_mark_agent_retry(row_num, "RETRY_RUNTIME")
+            safe_add_log(
+                row_number=row_num,
+                status="RETRY_RUNTIME",
+                log_type="COMBINED",
+                url=url,
+                message=str(error),
+            )
 
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
-            try:
-                context.close()
-            except Exception:
-                pass
-            try:
-                browser.close()
-            except Exception:
-                pass
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
 
 def run_parallel_combined_scraper(max_workers=2):
     get_url_rows = getattr(sheets, "get_url_rows_with_retry", None)
