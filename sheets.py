@@ -6,6 +6,7 @@ Sheet layout used by the scraper:
     I:L  -> claim agent/time/token/status
     M:N  -> headline/description
     O    -> image URL
+    P    -> optional STOP flag
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ CLAIM_STATUS_COL = 12          # L
 HEADLINE_COL = 13              # M
 DESCRIPTION_COL = 14           # N
 IMAGE_URL_COL = 15             # O
+STOP_FLAG_COL = 16             # P (M:O are scraper output columns)
 MEDIA_VALUE_COL = 6            # F: video ID, "image", "text", ERROR, etc.
 
 CLAIM_TTL_MINUTES = 15
@@ -271,6 +273,7 @@ def get_agent_rows_snapshot(force_refresh: bool = False):
         claim_time = _cell(row, CLAIM_TIME_COL)
         claim_token = _cell(row, CLAIM_TOKEN_COL)
         claim_status = _cell(row, CLAIM_STATUS_COL)
+        stop_flag = _cell(row, STOP_FLAG_COL)
 
         rows.append(
             {
@@ -282,6 +285,7 @@ def get_agent_rows_snapshot(force_refresh: bool = False):
                 "claim_time": claim_time,
                 "claim_token": claim_token,
                 "claim_status": claim_status,
+                "stop_flag": stop_flag,
                 "processed": bool(media_value),
                 "claim_expired": is_claim_expired(claim_time),
             }
@@ -342,6 +346,9 @@ def get_next_agent_task(direction: str, agent_name: str, run_id: str):
 
     for candidate in candidates:
         row_num = candidate["row_num"]
+
+        if candidate["stop_flag"].upper() == "STOP":
+            return "COLLISION_STOP"
 
         if (
             candidate["claim_agent"]
