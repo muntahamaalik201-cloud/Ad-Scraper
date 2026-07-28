@@ -2248,14 +2248,14 @@ def scrape_single_url(url_row):
                     app_link="N/A",
                     message="Video/player evidence found, but ID was not exposed. Row left unprocessed for retry.",
                 )
-                return
+                return "RETRY"
 
             # =========================
             # IMAGE AD: no extra processing
             # =========================
             if kind == "image":
                 save_fast_image_ad(page, row_num, url, advertiser)
-                return
+                return "DONE"
 
             # =========================
             # VIDEO AD: column F = real video ID
@@ -2308,7 +2308,7 @@ def scrape_single_url(url_row):
                     message=message,
                 )
                 print(f"✅ Row {row_num}: saved VIDEO ad")
-                return
+                return "DONE"
 
             # =========================
             # TEXT AD: column F = text
@@ -2370,7 +2370,7 @@ def scrape_single_url(url_row):
                     message=message,
                 )
                 print(f"✅ Row {row_num}: saved TEXT ad")
-                return
+                return "DONE"
 
             # No supported creative could be verified. Keep the old N/A behavior.
             process_time = get_exact_time()
@@ -2395,6 +2395,7 @@ def scrape_single_url(url_row):
                 message="No video ID and no valid text/image creative found",
             )
             print(f"⏭ Row {row_num}: no supported creative found")
+            return "DONE"
 
         except TransientHTTPError as error:
             status_code = error.status or "NETWORK"
@@ -2410,6 +2411,7 @@ def scrape_single_url(url_row):
                 url=url,
                 message=str(error),
             )
+            return "RETRY"
 
         except Exception as error:
             error_time = get_exact_time()
@@ -2425,6 +2427,7 @@ def scrape_single_url(url_row):
                 url=url,
                 message=str(error),
             )
+            return "RETRY"
 
         finally:
             if page is not None:
