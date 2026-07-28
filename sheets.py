@@ -40,7 +40,7 @@ CLAIM_TIME_COL = 10
 CLAIM_TOKEN_COL = 11
 CLAIM_STATUS_COL = 12
 CLAIM_TTL_MINUTES = 15
-RETRY_COOLDOWN_MINUTES = 30
+RETRY_COOLDOWN_MINUTES = 5
 
 LOG_CACHE = []
 WRITE_LOGS = False
@@ -268,20 +268,15 @@ def get_agent_rows_snapshot(force_refresh=False):
 # ==========================
 # CORE TASK PICKER
 # ==========================
-def get_next_agent_task(direction, agent_name, run_id, excluded_rows=None):
+def get_next_agent_task(direction, agent_name, run_id):
     direction = direction.lower().strip()
     if direction not in {"top", "bottom"}:
         raise ValueError("direction must be top or bottom")
 
-    excluded_rows = {int(row_num) for row_num in (excluded_rows or set())}
-
     sheet = get_sheet()
     rows = get_agent_rows_snapshot()
 
-    unprocessed = [
-        row for row in rows
-        if row["url"] and not row["processed"] and row["row_num"] not in excluded_rows
-    ]
+    unprocessed = [row for row in rows if row["url"] and not row["processed"]]
     if not unprocessed:
         return None
 
