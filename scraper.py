@@ -1,4 +1,4 @@
-# Combined Google Ads Transparency scraper - V6
+# Combined Google Ads Transparency scraper - V7
 # Video-ad detection logic is kept from the original scrapper.txt.
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
 
@@ -59,6 +59,19 @@ VIDEO_PENDING_RETRY_STATUS = "RETRY_VIDEO_ID"
 PLAYWRIGHT_ACTION_TIMEOUT_MS = 4000
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".m3u8")
+
+# Never run regex/URL decoding across multi-megabyte page HTML.  The previous
+# implementation could spend several minutes inside re.search().
+MAX_VIDEO_SCAN_CHARS = 300_000
+MAX_VIDEO_SCAN_WINDOWS = 96
+VIDEO_SCAN_PREFIX_SUFFIX_CHARS = 24_000
+VIDEO_SCAN_WINDOW_BEFORE = 512
+VIDEO_SCAN_WINDOW_AFTER = 2_048
+VIDEO_SCAN_MARKERS = (
+    "youtube.com/", "youtu.be/", "videoid", "video_id", "videoplayback",
+    "googlevideo.com", "youtubei/v1/player", "get_video_info", "docid",
+    ".mp4", ".webm", ".mov", ".m4v", ".m3u8",
+)
 
 INSTALL_SELECTORS = [
     "a.install-button-anchor.svg-anchor",
@@ -188,27 +201,69 @@ def is_real_video_response(response):
     return False
 
 
-def extract_video_id_from_any_text(raw_value):
-    """Extract a real video identifier from escaped HTML, JSON, or URLs."""
-    if raw_value is None:
-        return None
+def _bounded_video_scan_chunks(raw_text):
+    """Yield small candidate chunks instead of scanning an entire HTML document."""
+    if not raw_text:
+        return
+
+    length = len(raw_text)
+    if length <= MAX_VIDEO_SCAN_CHARS:
+        yield raw_text
+        return
+
+    # Keep useful page edges, then only windows surrounding video-specific markers.
+    yield raw_text[:VIDEO_SCAN_PREFIX_SUFFIX_CHARS]
+    yield raw_text[-VIDEO_SCAN_PREFIX_SUFFIX_CHARS:]
 
     try:
-        text = str(raw_value)
+        lowered = raw_text.lower()
     except Exception:
-        return None
+        return
 
-    # Google/YouTube data is often URL encoded, HTML encoded, or JSON escaped.
-    for _ in range(3):
+    emitted = 2
+    seen_ranges = set()
+
+    for marker in VIDEO_SCAN_MARKERS:
+        search_from = 0
+        marker_hits = 0
+
+        while emitted < MAX_VIDEO_SCAN_WINDOWS and marker_hits < 16:
+            position = lowered.find(marker, search_from)
+            if position < 0:
+                break
+
+            chunk_start = max(0, position - VIDEO_SCAN_WINDOW_BEFORE)
+            chunk_end = min(length, position + len(marker) + VIDEO_SCAN_WINDOW_AFTER)
+            range_key = (chunk_start // 256, chunk_end // 256)
+
+            if range_key not in seen_ranges:
+                seen_ranges.add(range_key)
+                yield raw_text[chunk_start:chunk_end]
+                emitted += 1
+
+            marker_hits += 1
+            search_from = position + max(1, len(marker))
+
+
+def _decode_video_candidate_chunk(chunk):
+    """Decode a bounded candidate chunk without repeatedly copying huge page HTML."""
+    text = chunk
+
+    for _ in range(2):
         previous = text
-        try:
-            text = unquote(text)
-        except Exception:
-            pass
-        try:
-            text = html_unescape(text)
-        except Exception:
-            pass
+
+        if "%" in text:
+            try:
+                text = unquote(text)
+            except Exception:
+                pass
+
+        if "&" in text:
+            try:
+                text = html_unescape(text)
+            except Exception:
+                pass
+
         text = (
             text.replace(r"\\/", "/")
                 .replace(r"\/", "/")
@@ -227,34 +282,56 @@ def extract_video_id_from_any_text(raw_value):
                 .replace(r'\\"', '"')
                 .replace(r'\"', '"')
         )
+
         if text == previous:
             break
 
-    patterns = [
-        r'(?:youtube\.com/(?:embed|shorts)/|youtu\.be/)([A-Za-z0-9_-]{11})',
-        r'youtube\.com/watch[^\s"\'<>]*[?&]v=([A-Za-z0-9_-]{11})',
-        r'["\']videoId["\']\s*[:=]\s*["\']([A-Za-z0-9_-]{11})["\']',
-        r'["\']video_id["\']\s*[:=]\s*["\']([A-Za-z0-9_-]{11})["\']',
-        r'(?:videoId|video_id|videoid|docid|v)=([A-Za-z0-9_-]{11})(?:[^A-Za-z0-9_-]|$)',
-        r'data-(?:video-id|videoid)=["\']([A-Za-z0-9_-]{6,})["\']',
-    ]
+    return text
 
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1)
 
-    # Direct media files are valid IDs for non-YouTube video creatives.
-    media_match = re.search(
-        r'([^/?#"\']+\.(?:mp4|webm|mov|m4v|m3u8))(?:[?#"\']|$)',
-        text,
-        re.IGNORECASE,
+def extract_video_id_from_any_text(raw_value):
+    """
+    Extract a real video identifier from escaped HTML, JSON, or URLs.
+
+    Important: only bounded candidate windows are decoded and searched.  This
+    prevents catastrophic runtimes when Google returns multi-megabyte HTML or
+    large embedded JSON blobs.
+    """
+    if raw_value is None:
+        return None
+
+    try:
+        raw_text = str(raw_value)
+    except Exception:
+        return None
+
+    patterns = (
+        re.compile(r'(?:youtube\.com/(?:embed|shorts)/|youtu\.be/)([A-Za-z0-9_-]{11})', re.I),
+        re.compile(r'youtube\.com/watch[^\s"\'<>]{0,768}?[?&]v=([A-Za-z0-9_-]{11})', re.I),
+        re.compile(r'["\']videoId["\']\s*[:=]\s*["\']([A-Za-z0-9_-]{11})["\']', re.I),
+        re.compile(r'["\']video_id["\']\s*[:=]\s*["\']([A-Za-z0-9_-]{11})["\']', re.I),
+        re.compile(r'(?:videoId|video_id|videoid|docid|v)=([A-Za-z0-9_-]{11})(?:[^A-Za-z0-9_-]|$)', re.I),
+        re.compile(r'data-(?:video-id|videoid)=["\']([A-Za-z0-9_-]{6,})["\']', re.I),
+        re.compile(r'(?:videoplayback|googlevideo\.com)[^\s"\'<>]{0,1024}?[?&]id=([A-Za-z0-9_-]{6,})', re.I),
     )
-    if media_match:
-        return media_match.group(1)
+    media_pattern = re.compile(
+        r'([^/?#"\'\s]{1,220}\.(?:mp4|webm|mov|m4v|m3u8))(?:[?#"\'\s]|$)',
+        re.I,
+    )
+
+    for raw_chunk in _bounded_video_scan_chunks(raw_text):
+        chunk = _decode_video_candidate_chunk(raw_chunk)
+
+        for pattern in patterns:
+            match = pattern.search(chunk)
+            if match:
+                return match.group(1)
+
+        media_match = media_pattern.search(chunk)
+        if media_match:
+            return media_match.group(1)
 
     return None
-
 
 def extract_video_id_from_url(req_url):
     """Extract a clean YouTube/video identifier or media filename from a URL."""
@@ -313,45 +390,91 @@ def extract_video_id_from_json_payload(payload):
 
 
 def scan_embedded_video_metadata(page):
-    """Scan every active frame for escaped player metadata and video URLs."""
+    """
+    Scan active frames for video metadata without returning full page HTML.
+
+    The browser returns only bounded snippets surrounding video markers.  This
+    keeps classification well below the agent's three-minute watchdog timeout.
+    """
     js = r"""
     () => {
-        const chunks = [];
-        const add = (value) => {
-            if (value === undefined || value === null) return;
+        const output = [];
+        const seen = new Set();
+        const markers = [
+            'youtube.com/', 'youtu.be/', 'videoid', 'video_id',
+            'videoplayback', 'googlevideo.com', 'youtubei/v1/player',
+            'get_video_info', 'docid', '.mp4', '.webm', '.mov', '.m4v', '.m3u8'
+        ];
+        const MAX_CHUNKS = 120;
+        const MAX_RESULT_CHARS = 250000;
+
+        const push = (value) => {
+            if (output.length >= MAX_CHUNKS || value === undefined || value === null) return;
+            let text = '';
             try {
-                const text = typeof value === 'string' ? value : JSON.stringify(value);
-                if (text) chunks.push(text);
-            } catch (_) {}
+                text = typeof value === 'string' ? value : JSON.stringify(value);
+            } catch (_) {
+                return;
+            }
+            if (!text) return;
+
+            const addChunk = (chunk) => {
+                if (!chunk || output.length >= MAX_CHUNKS) return;
+                const bounded = chunk.slice(0, 4096);
+                if (seen.has(bounded)) return;
+                seen.add(bounded);
+                output.push(bounded);
+            };
+
+            if (text.length <= 4096) {
+                const lower = text.toLowerCase();
+                if (markers.some(marker => lower.includes(marker))) addChunk(text);
+                return;
+            }
+
+            const lower = text.toLowerCase();
+            for (const marker of markers) {
+                let from = 0;
+                let hits = 0;
+                while (output.length < MAX_CHUNKS && hits < 8) {
+                    const index = lower.indexOf(marker, from);
+                    if (index < 0) break;
+                    addChunk(text.slice(Math.max(0, index - 512), index + marker.length + 2048));
+                    from = index + Math.max(1, marker.length);
+                    hits += 1;
+                }
+            }
         };
 
-        add(location.href);
-        add(document.documentElement ? document.documentElement.outerHTML : '');
+        push(location.href);
 
         for (const script of document.scripts || []) {
-            add(script.src || '');
-            add(script.textContent || '');
+            push(script.src || '');
+            push(script.textContent || '');
+            if (output.length >= MAX_CHUNKS) break;
         }
 
-        for (const el of document.querySelectorAll(
-            'video, source, iframe, a[href], [data-video-id], [data-videoid], [data-src], [data-href]'
-        )) {
-            for (const name of ['src', 'href', 'data-src', 'data-href', 'data-video-id', 'data-videoid']) {
-                add(el.getAttribute && el.getAttribute(name));
+        if (output.length < MAX_CHUNKS) {
+            for (const el of document.querySelectorAll(
+                'video, source, iframe, a[href], [data-video-id], [data-videoid], [data-src], [data-href]'
+            )) {
+                for (const name of ['src', 'href', 'data-src', 'data-href', 'data-video-id', 'data-videoid']) {
+                    push(el.getAttribute && el.getAttribute(name));
+                }
+                push(el.currentSrc || '');
+                if (output.length >= MAX_CHUNKS) break;
             }
-            add(el.currentSrc || '');
         }
 
-        // Common YouTube player globals, when same-origin access is available.
         for (const value of [
             window.ytInitialPlayerResponse,
             window.ytInitialData,
             window.ytplayer && window.ytplayer.config,
             window.playerResponse,
             window.__PLAYER_CONFIG__
-        ]) add(value);
+        ]) push(value);
 
-        return chunks.join('\n');
+        return output.join('\n').slice(0, MAX_RESULT_CHARS);
     }
     """
 
