@@ -1,204 +1,220 @@
-import multiprocessing as mp
+import faulthandler
 import os
-import queue
 import sys
 import time
 import uuid
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import sheets
 from scraper import scrape_single_url
 
-PAKISTAN_TZ = ZoneInfo("Asia/Karachi")
-MAX_RUNTIME_SECONDS = (5 * 60 * 60) + (50 * 60)  # 5h 50m
-ROW_TIMEOUT_SECONDS = 150
-BETWEEN_ROWS_SECONDS = 2
+
+MAX_RUNTIME_SECONDS = (5 * 60 * 60) + (50 * 60)  # 5h50m
+IDLE_RETRY_SECONDS = 5
+TASK_ERROR_RETRY_SECONDS = 10
+TRACEBACK_AFTER_SECONDS = 180
 
 
-def now_text():
-    return datetime.now(PAKISTAN_TZ).strftime("%I:%M:%S %p")
-
-
-def _scrape_child(row_num, url, result_queue):
-    """Run one Playwright scrape in an isolated child process."""
-    try:
-        result = scrape_single_url((row_num, url))
-        normalized = str(result or "DONE").upper()
-        if normalized not in {"DONE", "RETRY"}:
-            normalized = "DONE"
-        result_queue.put(("OK", normalized))
-    except BaseException as error:
-        try:
-            result_queue.put(("ERROR", f"{type(error).__name__}: {error}"))
-        except Exception:
-            pass
-        raise
-
-
-def scrape_with_timeout(row_num, url, timeout_seconds=ROW_TIMEOUT_SECONDS):
-    """
-    Isolate Chromium/Playwright per row.
-
-    A browser crash or native segfault can only kill the child process; the
-    top/bottom agent remains alive, defers the row, and moves to the next one.
-    """
-    ctx = mp.get_context("spawn")
-    result_queue = ctx.Queue(maxsize=1)
-    process = ctx.Process(
-        target=_scrape_child,
-        args=(row_num, url, result_queue),
-        daemon=False,
-    )
-
-    process.start()
-    process.join(timeout_seconds)
-
-    if process.is_alive():
-        process.terminate()
-        process.join(10)
-        if process.is_alive():
-            process.kill()
-            process.join(5)
-        return "RETRY", f"TIMEOUT after {timeout_seconds}s"
+def configure_live_output() -> None:
+    """Force immediate output in GitHub Actions and other non-interactive runners."""
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
     try:
-        status, message = result_queue.get_nowait()
-    except queue.Empty:
-        status, message = None, None
-    finally:
-        try:
-            result_queue.close()
-            result_queue.join_thread()
-        except Exception:
-            pass
+        sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    except (AttributeError, ValueError):
+        pass
 
-    if status == "OK":
-        return message, ""
+    try:
+        sys.stderr.reconfigure(line_buffering=True, write_through=True)
+    except (AttributeError, ValueError):
+        pass
 
-    if status == "ERROR":
-        return "RETRY", message
+    faulthandler.enable()
 
-    if process.exitcode == 0:
-        # Compatibility fallback for an older scraper that returned no value.
-        return "DONE", ""
+    # When a call blocks for 3 minutes, print the Python stack automatically.
+    # This makes it clear whether the agent is waiting in Sheets, Playwright,
+    # networking, or another function.
+    try:
+        faulthandler.dump_traceback_later(
+            TRACEBACK_AFTER_SECONDS,
+            repeat=True,
+        )
+    except (AttributeError, RuntimeError):
+        pass
 
-    return "RETRY", f"Child process exited with code {process.exitcode}"
+
+def now_text() -> str:
+    return datetime.now().strftime("%I:%M:%S %p")
 
 
-def run_agent(direction):
-    direction = str(direction or "").lower().strip()
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def run_agent(direction: str) -> None:
+    direction = direction.lower().strip()
+
     if direction not in {"top", "bottom"}:
-        raise ValueError("Use: python agent_runner.py top OR python agent_runner.py bottom")
+        raise ValueError(
+            "Use: python -u agent_runner.py top "
+            "OR python -u agent_runner.py bottom"
+        )
 
     agent_name = f"AGENT_{direction.upper()}"
     run_id = uuid.uuid4().hex[:8]
-    started_at = time.time()
-    deadline = started_at + MAX_RUNTIME_SECONDS
 
-    completed_count = 0
-    retry_count = 0
-    attempted_rows = set()
+    start_time = time.monotonic()
+    deadline = start_time + MAX_RUNTIME_SECONDS
+    processed_count = 0
 
-    print(
+    log(
         f"🚀 {agent_name} started at {now_text()} "
-        f"with run_id={run_id}, pid={os.getpid()}",
-        flush=True,
+        f"with run_id={run_id}, pid={os.getpid()}"
     )
 
-    while time.time() < deadline:
-        remaining_minutes = max(0, int((deadline - time.time()) / 60))
-        print(
+    sheets.add_log(
+        row_number="",
+        status="AGENT_STARTED",
+        log_type=agent_name,
+        message=f"{agent_name} started with run_id={run_id}",
+    )
+
+    while time.monotonic() < deadline:
+        remaining_seconds = int(deadline - time.monotonic())
+        if remaining_seconds <= 0:
+            break
+
+        log(
             f"📄 {agent_name}: requesting next {direction} task "
-            f"({remaining_minutes} minutes remaining)",
-            flush=True,
+            f"({remaining_seconds // 60} minutes remaining)"
         )
 
-        lookup_started = time.time()
+        task_started = time.monotonic()
+
         try:
             task = sheets.get_next_agent_task(
                 direction=direction,
                 agent_name=agent_name,
                 run_id=run_id,
-                excluded_rows=attempted_rows,
             )
         except Exception as error:
-            print(f"⚠️ {agent_name}: task lookup error: {error}", flush=True)
-            time.sleep(10)
+            elapsed = time.monotonic() - task_started
+            log(
+                f"❌ {agent_name}: task selection failed after "
+                f"{elapsed:.1f}s: {type(error).__name__}: {error}"
+            )
+
+            sheets.add_log(
+                row_number="",
+                status="TASK_SELECTION_ERROR",
+                log_type=agent_name,
+                message=str(error),
+            )
+
+            time.sleep(TASK_ERROR_RETRY_SECONDS)
             continue
 
-        print(
+        task_elapsed = time.monotonic() - task_started
+        log(
             f"📋 {agent_name}: task lookup completed in "
-            f"{time.time() - lookup_started:.1f}s; result={task}",
-            flush=True,
+            f"{task_elapsed:.1f}s; result={task!r}"
         )
 
         if task is None:
-            print(
-                f"✅ {agent_name}: no eligible rows remain in this run. "
-                "Deferred rows will be retried in a later run.",
-                flush=True,
+            log(f"✅ {agent_name}: no unprocessed rows left.")
+
+            sheets.add_log(
+                row_number="",
+                status="NO_ROWS_LEFT",
+                log_type=agent_name,
+                message="No unprocessed rows left",
             )
+            sheets.flush_logs()
             break
 
         if task == "COLLISION_STOP":
-            print(f"🛑 {agent_name}: collision stop reached", flush=True)
+            log(
+                f"🛑 {agent_name}: one unprocessed row remains; "
+                "bottom agent stopped to avoid claiming the same final row "
+                "as the top agent."
+            )
+            sheets.flush_logs()
             break
 
         row_num, url = task
-        attempted_rows.add(int(row_num))
+        log(f"🔒 {agent_name}: claimed row {row_num}")
+        log(f"🌐 {agent_name}: starting scraper for row {row_num}")
 
-        print(f"🔒 {agent_name}: claimed row {row_num}", flush=True)
-        print(f"🌐 {agent_name}: starting scraper for row {row_num}", flush=True)
-
-        row_started = time.time()
-        result, detail = scrape_with_timeout(row_num, url)
-        elapsed = time.time() - row_started
-
-        print(
-            f"💾 {agent_name}: scraper returned {result} for row {row_num} "
-            f"after {elapsed:.1f}s",
-            flush=True,
+        sheets.add_log(
+            row_number=row_num,
+            status="ROW_CLAIMED",
+            log_type=agent_name,
+            url=url,
+            message=f"{agent_name} claimed row {row_num}",
         )
 
-        if result == "DONE":
+        scrape_started = time.monotonic()
+
+        try:
+            scrape_single_url((row_num, url))
+
+            scrape_elapsed = time.monotonic() - scrape_started
+            log(
+                f"💾 {agent_name}: scraper returned for row {row_num} "
+                f"after {scrape_elapsed:.1f}s"
+            )
+
             sheets.mark_agent_done(row_num, agent_name)
-            completed_count += 1
-            print(
+            processed_count += 1
+
+            log(
                 f"✅ {agent_name}: finished row {row_num}; "
-                f"total completed={completed_count}",
-                flush=True,
-            )
-        else:
-            retry_count += 1
-            # The scraper normally sets a specific RETRY_* status. This parent
-            # fallback handles timeouts, child crashes, and native segfaults.
-            if detail:
-                status = "RETRY_TIMEOUT" if "TIMEOUT" in detail.upper() else "RETRY_CHILD_CRASH"
-                sheets.mark_agent_retry(row_num, status)
-            print(
-                f"⏭ {agent_name}: deferred row {row_num}; "
-                f"it will not be selected again in this run. "
-                f"Reason: {detail or 'retry requested by scraper'}",
-                flush=True,
+                f"total processed={processed_count}"
             )
 
-        time.sleep(BETWEEN_ROWS_SECONDS)
+        except Exception as error:
+            scrape_elapsed = time.monotonic() - scrape_started
+            log(
+                f"❌ {agent_name}: error on row {row_num} after "
+                f"{scrape_elapsed:.1f}s: {type(error).__name__}: {error}"
+            )
 
-    print(
+            sheets.add_log(
+                row_number=row_num,
+                status="AGENT_ROW_ERROR",
+                log_type=agent_name,
+                url=url,
+                message=str(error),
+            )
+
+        # Small pause to reduce Sheets API contention between agents.
+        time.sleep(2)
+
+    sheets.add_log(
+        row_number="",
+        status="AGENT_STOPPED",
+        log_type=agent_name,
+        message=(
+            f"{agent_name} stopped. "
+            f"Processed rows: {processed_count}"
+        ),
+    )
+    sheets.flush_logs()
+
+    total_elapsed = time.monotonic() - start_time
+    log(
         f"🛑 {agent_name} stopped at {now_text()}. "
-        f"Completed={completed_count}, Deferred={retry_count}, "
-        f"Attempted={len(attempted_rows)}",
-        flush=True,
+        f"Processed rows: {processed_count}. "
+        f"Runtime: {total_elapsed / 60:.1f} minutes"
     )
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
+    configure_live_output()
 
     if len(sys.argv) < 2:
-        print("Usage: python agent_runner.py top", flush=True)
-        print("Usage: python agent_runner.py bottom", flush=True)
-        raise SystemExit(1)
+        log("Usage: python -u agent_runner.py top")
+        log("Usage: python -u agent_runner.py bottom")
+        sys.exit(1)
 
     run_agent(sys.argv[1])
