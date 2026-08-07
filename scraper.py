@@ -1,5 +1,5 @@
 # Combined Google Ads Transparency scraper
-# V12: preserve V10/V11 video/text/image logic; fix text-ad Google Play destination package resolution.
+# V8: preserve V6 text/image logic; validate YouTube IDs from the active visible player only.
 # Video-ad detection logic is kept from the original scrapper.txt.
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
 
@@ -1368,406 +1368,6 @@ def extract_packages_from_text(raw_text):
 
     return candidates
 
-def extract_packages_from_url_recursive(raw_value, max_depth=4):
-    """
-    Extract Android package names from a URL even when the Play Store URL is
-    nested/encoded inside a Google Ads click URL.
-
-    TEXT-AD PACKAGE RESOLUTION ONLY.  This does not change ad classification.
-    """
-    if not raw_value or raw_value == "N/A":
-        return set()
-
-    found = set()
-    queue = [str(raw_value)]
-    seen = set()
-
-    for _ in range(max_depth):
-        if not queue:
-            break
-
-        next_queue = []
-        for value in queue:
-            if not value or value in seen:
-                continue
-            seen.add(value)
-
-            # Try both the original and repeatedly URL-decoded forms.
-            variants = [value]
-            decoded = value
-            for _decode_round in range(3):
-                try:
-                    new_decoded = unquote(decoded)
-                except Exception:
-                    break
-                if not new_decoded or new_decoded == decoded:
-                    break
-                variants.append(new_decoded)
-                decoded = new_decoded
-
-            for variant in variants:
-                try:
-                    found.update(extract_packages_from_text(variant))
-                except Exception:
-                    pass
-
-                # Follow nested destination/adurl/url query values without
-                # making any network request or clicking the ad.
-                try:
-                    parsed = urlparse(variant)
-                    query = parse_qs(parsed.query, keep_blank_values=True)
-                    for values in query.values():
-                        for nested in values:
-                            if nested and nested not in seen:
-                                next_queue.append(str(nested))
-                except Exception:
-                    pass
-
-        queue = next_queue
-
-    return found
-
-
-
-def extract_text_ad_destination_urls(page, headline="", description=""):
-    """
-    TEXT-AD ONLY.
-
-    Find the visible destination anchor for the active text creative even when
-    its label is "Google Play" rather than Install/Get/Download.
-
-    This function deliberately does NOT change the global install-link logic,
-    image classification, or video detection.
-    """
-    js = r"""
-    (needle) => {
-        const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-        const lower = (v) => norm(v).toLowerCase();
-        const isVisible = (el) => {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            const st = window.getComputedStyle(el);
-            return r.width > 0 && r.height > 0 &&
-                   st.display !== 'none' && st.visibility !== 'hidden' &&
-                   st.opacity !== '0';
-        };
-
-        const attrs = [
-            'href', 'data-href', 'data-url', 'data-destination-url',
-            'data-final-url', 'data-click-url', 'data-landing-url',
-            'data-dest-url', 'data-adurl'
-        ];
-        const wantedNeedle = lower(needle || '');
-        const out = [];
-
-        const nodes = Array.from(document.querySelectorAll(
-            'a, [data-href], [data-url], [data-destination-url], [data-final-url], [data-click-url], [data-landing-url], [data-dest-url], [data-adurl]'
-        ));
-
-        for (const el of nodes) {
-            if (!isVisible(el)) continue;
-
-            const txt = lower(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
-            const cls = lower(el.className || '');
-            const r = el.getBoundingClientRect();
-
-            let values = [];
-            for (const a of attrs) {
-                let v = '';
-                try {
-                    if (a === 'href' && el.href) v = el.href;
-                    if (!v) v = el.getAttribute(a) || '';
-                } catch (_) {}
-                if (v) values.push(v);
-            }
-            values = Array.from(new Set(values));
-
-            for (const url of values) {
-                const u = lower(url);
-                const good =
-                    u.includes('play.google.com') ||
-                    u.includes('googleadservices.com') ||
-                    u.includes('google.com/aclk') ||
-                    u.includes('doubleclick.net') ||
-                    u.includes('apps.apple.com') ||
-                    u.includes('itunes.apple.com');
-                if (!good) continue;
-
-                let score = 0;
-                if (u.includes('play.google.com/store/apps/details')) score += 250;
-                else if (u.includes('play.google.com')) score += 180;
-                if (u.includes('googleadservices.com/pagead/aclk')) score += 140;
-                else if (u.includes('googleadservices.com') || u.includes('google.com/aclk')) score += 100;
-
-                if (txt.includes('google play')) score += 180;
-                if (txt.includes('install')) score += 140;
-                if (txt === 'get' || txt.includes('download')) score += 100;
-                if (cls.includes('install-button-anchor')) score += 120;
-                if (wantedNeedle && txt && (txt.includes(wantedNeedle) || wantedNeedle.includes(txt))) score += 80;
-
-                // Active ad links are normally in the upper creative area.
-                if (r.top >= -100 && r.top <= 900) score += 30;
-                if (r.width >= 40 && r.height >= 15) score += 20;
-
-                out.push({url, score, text: txt});
-            }
-        }
-
-        out.sort((a, b) => b.score - a.score);
-        const seen = new Set();
-        return out.filter(x => {
-            if (!x.url || seen.has(x.url)) return false;
-            seen.add(x.url);
-            return true;
-        }).slice(0, 12);
-    }
-    """
-
-    needle = clean_text(headline)
-    if needle == "N/A":
-        needle = ""
-
-    ranked_results = []
-
-    # Prefer the same active-creative ranking already used elsewhere.
-    try:
-        targets = [item[1] for item in get_ranked_non_video_targets(page)[:4]]
-    except Exception:
-        targets = []
-
-    if page not in targets:
-        targets.append(page)
-
-    for frame in page.frames:
-        if frame == page.main_frame or frame in targets:
-            continue
-        targets.append(frame)
-
-    for target_index, target in enumerate(targets):
-        try:
-            rows = target.evaluate(js, needle) or []
-            for row in rows:
-                url = str(row.get('url') or '').strip()
-                if not url:
-                    continue
-                score = float(row.get('score') or 0)
-                # Earlier/high-ranked active targets get a small preference.
-                score += max(0, 40 - target_index * 5)
-                ranked_results.append((score, url))
-        except Exception:
-            continue
-
-    ranked_results.sort(key=lambda x: x[0], reverse=True)
-    result = []
-    seen = set()
-    for _, url in ranked_results:
-        if url not in seen:
-            seen.add(url)
-            result.append(url)
-    return result[:12]
-
-
-def resolve_package_from_text_destination_redirect(page, destination_urls, max_urls=3):
-    """
-    TEXT-AD ONLY, final package fallback.
-
-    Some Google Ads text creatives expose only a googleadservices/aclk URL.
-    The Play Store package exists only after the server redirect, so it cannot
-    be found by parsing the DOM alone.  Resolve a very small number of the
-    highest-confidence visible text-ad destination URLs using the browser
-    context's request client (no page navigation and no DOM mutation).
-    """
-    if not destination_urls:
-        return None, "N/A"
-
-    request_ctx = None
-    try:
-        request_ctx = page.context.request
-    except Exception:
-        return None, "N/A"
-
-    for raw_url in destination_urls[:max_urls]:
-        if not raw_url:
-            continue
-
-        # First, parsing may already reveal an encoded Play Store URL.
-        parsed_candidates = extract_packages_from_url_recursive(raw_url)
-        if len(parsed_candidates) == 1:
-            pkg = next(iter(parsed_candidates))
-            return pkg, f"https://play.google.com/store/apps/details?id={pkg}"
-
-        lower = raw_url.lower()
-        if not (
-            'googleadservices.com' in lower or
-            'google.com/aclk' in lower or
-            'doubleclick.net' in lower or
-            'play.google.com' in lower
-        ):
-            continue
-
-        # HEAD is cheap and normally enough to reveal Location/final URL.
-        try:
-            resp = request_ctx.fetch(
-                raw_url,
-                method='HEAD',
-                timeout=5000,
-                fail_on_status_code=False,
-                max_redirects=10,
-            )
-            final_url = str(resp.url or '')
-            cands = extract_packages_from_url_recursive(final_url)
-            if len(cands) == 1:
-                pkg = next(iter(cands))
-                return pkg, f"https://play.google.com/store/apps/details?id={pkg}"
-
-            # Also inspect a Location header if redirect following stopped early.
-            try:
-                location = (resp.headers or {}).get('location', '')
-            except Exception:
-                location = ''
-            cands = extract_packages_from_url_recursive(location)
-            if len(cands) == 1:
-                pkg = next(iter(cands))
-                return pkg, f"https://play.google.com/store/apps/details?id={pkg}"
-        except Exception:
-            pass
-
-        # Some aclk endpoints do not support HEAD.  GET only this one visible
-        # destination URL as a fallback, still outside the page/browser DOM.
-        try:
-            resp = request_ctx.get(
-                raw_url,
-                timeout=6500,
-                fail_on_status_code=False,
-                max_redirects=10,
-            )
-            final_url = str(resp.url or '')
-            cands = extract_packages_from_url_recursive(final_url)
-            if len(cands) == 1:
-                pkg = next(iter(cands))
-                return pkg, f"https://play.google.com/store/apps/details?id={pkg}"
-
-            # Occasionally the final HTML contains a canonical Play Store URL.
-            try:
-                body = resp.text()
-            except Exception:
-                body = ''
-            if body:
-                cands = extract_packages_from_text(body[:1500000])
-                if len(cands) == 1:
-                    pkg = next(iter(cands))
-                    return pkg, f"https://play.google.com/store/apps/details?id={pkg}"
-        except Exception:
-            continue
-
-    return None, "N/A"
-
-def resolve_text_ad_package(page, captured, headline, description, visible_app_link):
-    """
-    Resolve package name for TEXT ads only.
-
-    V12 keeps all existing V11 sources and adds the missing Google-Play-labelled
-    text-ad destination anchor.  If that anchor is an opaque aclk URL, a final
-    bounded redirect resolution is used to obtain the Play Store package.
-
-    Returns: (package_name_or_None, app_link, match_score, source)
-    """
-    direct_package = extract_package_name(visible_app_link)
-    if direct_package != "N/A":
-        return direct_package, visible_app_link, 1.0, "visible_install_link"
-
-    visible_candidates = extract_packages_from_url_recursive(visible_app_link)
-    if len(visible_candidates) == 1:
-        package_name = next(iter(visible_candidates))
-        return (
-            package_name,
-            f"https://play.google.com/store/apps/details?id={package_name}",
-            1.0,
-            "encoded_visible_install_link",
-        )
-
-    # NEW: text ads commonly label their app destination simply "Google Play".
-    # The old Install/Get/Download-only selector never saw these links.
-    text_destination_urls = extract_text_ad_destination_urls(
-        page,
-        headline=headline,
-        description=description,
-    )
-
-    destination_candidates = set()
-    for dest_url in text_destination_urls:
-        direct = extract_package_name(dest_url)
-        if direct != "N/A":
-            return direct, dest_url, 1.0, "text_google_play_link"
-        destination_candidates.update(extract_packages_from_url_recursive(dest_url))
-
-    if len(destination_candidates) == 1:
-        package_name = next(iter(destination_candidates))
-        return (
-            package_name,
-            f"https://play.google.com/store/apps/details?id={package_name}",
-            1.0,
-            "encoded_text_google_play_link",
-        )
-
-    network_candidates = set(captured.get("_package_candidates", set()) or set())
-
-    if len(network_candidates) == 1:
-        package_name = next(iter(network_candidates))
-        return (
-            package_name,
-            f"https://play.google.com/store/apps/details?id={package_name}",
-            1.0,
-            "text_ad_network",
-        )
-
-    page_candidates = set(extract_package_from_page(page) or set())
-    all_candidates = set()
-    all_candidates.update(visible_candidates)
-    all_candidates.update(destination_candidates)
-    all_candidates.update(network_candidates)
-    all_candidates.update(page_candidates)
-
-    package_name, match_score = get_best_matching_package(
-        headline,
-        description,
-        all_candidates,
-    )
-    if package_name:
-        return (
-            package_name,
-            f"https://play.google.com/store/apps/details?id={package_name}",
-            match_score,
-            "strict_text_match",
-        )
-
-    if len(all_candidates) == 1:
-        package_name = next(iter(all_candidates))
-        return (
-            package_name,
-            f"https://play.google.com/store/apps/details?id={package_name}",
-            1.0,
-            "single_text_candidate",
-        )
-
-    # Final fallback only for TEXT ads: resolve the actual visible Google Play /
-    # googleadservices destination.  This is not used for image or video ads.
-    redirect_package, redirect_app_link = resolve_package_from_text_destination_redirect(
-        page,
-        text_destination_urls,
-        max_urls=3,
-    )
-    if redirect_package:
-        return (
-            redirect_package,
-            redirect_app_link,
-            1.0,
-            "text_destination_redirect",
-        )
-
-    return None, "N/A", match_score, "not_found"
-
-
 def extract_package_from_page(page):
     """
     Scans strictly the rendered DOM and visible links. 
@@ -2651,22 +2251,12 @@ def scrape_single_url(url_row):
             page = context.new_page()
             page.set_default_timeout(PLAYWRIGHT_ACTION_TIMEOUT_MS)
             page.set_default_navigation_timeout(60000)
-            captured = {"video_id": "N/A", "playback_id": "N/A", "_youtube_player_requests": [], "_video_evidence": False, "_package_candidates": set()}
+            captured = {"video_id": "N/A", "playback_id": "N/A", "_youtube_player_requests": [], "_video_evidence": False}
 
             def handle_request(request):
                 try:
                     request_url = str(request.url or "")
                     lower = request_url.lower()
-
-                    # Text-ad package candidates are collected passively from
-                    # network URLs.  They are used ONLY if the creative is later
-                    # classified as text.
-                    try:
-                        captured["_package_candidates"].update(
-                            extract_packages_from_url_recursive(request_url)
-                        )
-                    except Exception:
-                        pass
 
                     # This is the exact ID requested by the user: the value of
                     # `id=` on the actual videoplayback media request.
@@ -2698,13 +2288,6 @@ def scrape_single_url(url_row):
             def handle_response(response):
                 try:
                     response_url = str(response.url or "")
-                    try:
-                        captured["_package_candidates"].update(
-                            extract_packages_from_url_recursive(response_url)
-                        )
-                    except Exception:
-                        pass
-
                     playback_id = extract_videoplayback_id(response_url)
                     if playback_id:
                         # Always overwrite earlier metadata/direct candidates.
@@ -2808,13 +2391,11 @@ def scrape_single_url(url_row):
                 return
 
             # =========================
-            # TEXT AD: exact logic from the uploaded working reference
+            # TEXT AD: reference logic from user's uploaded working scraper
             # Column F = text
             # =========================
             if kind == "text":
-                # Re-read text with the exact text-ad selectors/flow from the
-                # user's uploaded working scraper.  This does not touch video
-                # or image classification.
+                # Re-read headline/description using the exact reference text-ad flow.
                 text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
                 ref_headline = clean_text(text_data.get("headline"))
                 ref_description = clean_text(text_data.get("description"))
@@ -2827,7 +2408,7 @@ def scrape_single_url(url_row):
                     print(f"📄 Row {row_num}: text ad found -> {headline}")
                     process_time = get_exact_time()
 
-                    # EXACT reference flow: visible install link first.
+                    # Reference flow: visible install link first.
                     visible_app_link = wait_and_extract_install_link(
                         page,
                         max_wait_seconds=8,
@@ -2842,8 +2423,8 @@ def scrape_single_url(url_row):
                         message = "Non-video text ad package extracted from visible install link"
                         print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
                     else:
-                        # EXACT reference fallback: scan rendered DOM/links, then
-                        # strictly match package against visible headline + description.
+                        # Reference fallback: scan rendered DOM/links, then strictly
+                        # match package against visible headline + description.
                         print(
                             f"📦 Row {row_num}: visible install link not found, "
                             "strict matching with headline + description"
