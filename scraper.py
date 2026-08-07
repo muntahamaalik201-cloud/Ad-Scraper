@@ -183,53 +183,82 @@ def is_real_video_response(response):
     return False
 
 
+def extract_videoplayback_id(req_url):
+    """
+    Return ONLY the value of the `id` query parameter from an actual
+    YouTube/Google `videoplayback` media request.
+
+    Example:
+        .../videoplayback?...&id=c4aa113822163fa0&itag=18...
+        -> c4aa113822163fa0
+
+    No YouTube watch/embed ID, thumbnail ID, itag, ei or source value is
+    accepted here.
+    """
+    try:
+        raw_url = str(req_url or "").strip()
+        if not raw_url:
+            return None
+
+        parsed = urlparse(raw_url)
+        lower = raw_url.lower()
+        host = str(parsed.netloc or "").lower()
+        path = str(parsed.path or "").lower()
+
+        # Require an actual media-playback request. googlevideo hosts normally
+        # use /videoplayback, but keep the host check as a fallback.
+        if "videoplayback" not in lower and "googlevideo.com" not in host:
+            return None
+
+        # Normal query parsing first.
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        values = query.get("id") or query.get("ID")
+        if values:
+            value = unquote(str(values[0] or "")).strip()
+            if value:
+                return value
+
+        # Defensive fallback for unusual/partially escaped query strings.
+        match = re.search(r"(?:[?&]|\\u0026|%26)id(?:=|%3[dD]|\\u003[dD])([^&\\]+)", raw_url, re.I)
+        if match:
+            value = unquote(match.group(1)).strip()
+            if value:
+                return value
+    except Exception:
+        pass
+    return None
+
+
 def extract_video_id_from_url(req_url):
     """
-    Extract a video ID only when the URL itself explicitly identifies the video.
+    Final video-ID extractor.
 
-    IMPORTANT:
-    - YouTube thumbnails are NOT accepted here.
-    - videoplayback id/itag/ei/source are NOT accepted as YouTube video IDs.
-    - The active YouTube player is queried separately for its real 11-char ID.
+    For YouTube/Google video ads, ONLY the `id=` value from the actual
+    `videoplayback` request is returned. Other YouTube IDs are intentionally
+    not returned because Column F must contain the playback-request ID.
+
+    Direct non-YouTube video files keep the previous filename fallback.
     """
     try:
         raw_url = str(req_url or "")
         url_lower = raw_url.lower()
         parsed = urlparse(raw_url)
-        query = parse_qs(parsed.query)
 
-        patterns = [
-            r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]{11})",
-            r"youtube\.com/shorts/([A-Za-z0-9_-]{11})",
-            r"youtube\.com/v/([A-Za-z0-9_-]{11})",
-            r"youtu\.be/([A-Za-z0-9_-]{11})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, raw_url, re.IGNORECASE)
-            if match:
-                return match.group(1)
+        playback_id = extract_videoplayback_id(raw_url)
+        if playback_id:
+            return playback_id
 
-        if "youtube.com/watch" in url_lower:
-            value = query.get("v", [None])[0]
-            if value and re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
-                return value
-
-        # A googlevideo/videoplayback URL proves video activity but its `id`
-        # parameter is often a playback identifier, not the public YouTube ID.
-        if "videoplayback" in url_lower or "googlevideo.com" in url_lower:
-            return None
-
-        # Preserve direct-file behavior for non-YouTube hosted videos.
-        for ext in VIDEO_EXTENSIONS:
-            if ext in url_lower:
-                filename = parsed.path.split("/")[-1].split("?")[0].strip()
-                if filename:
-                    return filename
+        # Preserve direct-file behavior for non-YouTube hosted video files.
+        if "youtube.com" not in url_lower and "youtu.be" not in url_lower and "googlevideo.com" not in url_lower:
+            for ext in VIDEO_EXTENSIONS:
+                if ext in url_lower:
+                    filename = parsed.path.split("/")[-1].split("?")[0].strip()
+                    if filename:
+                        return filename
     except Exception:
         return None
 
     return None
-
 
 def extract_video_id_from_json_payload(payload):
     """Read only the top-level videoId from a YouTube PLAYER REQUEST."""
@@ -386,11 +415,7 @@ def scan_embedded_video_metadata(page):
 
 
 def extract_video_from_dom(page):
-    """Read video IDs only from visible player/video DOM."""
-    youtube_id = extract_active_youtube_player_id(page)
-    if youtube_id != "N/A":
-        return youtube_id
-
+    """Read ONLY actual media URLs from visible video/source DOM nodes."""
     for frame in page.frames:
         if frame != page.main_frame and not _frame_visible_for_video(frame, page):
             continue
@@ -404,7 +429,7 @@ def extract_video_from_dom(page):
                         return r.width > 0 && r.height > 0 &&
                                s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
                     };
-                    return Array.from(document.querySelectorAll('video, source, iframe'))
+                    return Array.from(document.querySelectorAll('video, source'))
                         .filter(el => el.tagName.toLowerCase() === 'source' || visible(el))
                         .flatMap(el => [el.currentSrc || '', el.src || '', el.getAttribute('src') || ''])
                         .filter(Boolean);
@@ -419,33 +444,26 @@ def extract_video_from_dom(page):
 
     return "N/A"
 
-
 def scan_browser_performance_for_video(page):
-    """Use resource entries as video evidence, but get YouTube ID from the active player."""
-    saw_youtube_media = False
-
+    """
+    Scan resource timing entries for the actual `videoplayback` request and
+    return ONLY its `id=` value. This is a fallback for a request that fired
+    before/around Playwright event delivery.
+    """
     for frame in page.frames:
-        if frame == page.main_frame or not _frame_visible_for_video(frame, page):
-            continue
         try:
             urls = frame.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
-            for u in urls:
-                u = str(u)
-                lower = u.lower()
+            for u in reversed(urls or []):
+                playback_id = extract_videoplayback_id(str(u))
+                if playback_id:
+                    return playback_id
 
-                direct_id = extract_video_id_from_url(u)
+                # Keep direct non-YouTube file fallback only.
+                direct_id = extract_video_id_from_url(str(u))
                 if direct_id:
                     return direct_id
-
-                if "videoplayback" in lower or "googlevideo.com" in lower:
-                    saw_youtube_media = True
         except Exception:
             continue
-
-    if saw_youtube_media:
-        found = extract_active_youtube_player_id(page)
-        if found != "N/A":
-            return found
 
     return "N/A"
 
@@ -539,22 +557,36 @@ def click_possible_video_targets(page):
     return False
 
 def wait_for_video_id(page, captured, max_seconds=20):
-    waited = 0
+    """Wait for the actual videoplayback `id=` value, not YouTube metadata."""
+    waited = 0.0
 
     while waited < max_seconds:
-        if captured.get("video_id") and captured["video_id"] != "N/A":
-            return captured["video_id"]
+        playback_id = captured.get("playback_id")
+        if playback_id and playback_id != "N/A":
+            captured["video_id"] = playback_id
+            return playback_id
+
+        # Compatibility: only trust captured video_id when it was populated by
+        # the media-request handler/direct non-YouTube file path.
+        captured_id = captured.get("video_id")
+        if captured_id and captured_id != "N/A" and not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(captured_id)):
+            return captured_id
 
         dom_video_id = extract_video_from_dom(page)
         if dom_video_id != "N/A":
+            captured["video_id"] = dom_video_id
             return dom_video_id
 
-        page.wait_for_timeout(500)
-        waited += 0.5
+        perf_video_id = scan_browser_performance_for_video(page)
+        if perf_video_id != "N/A":
+            captured["video_id"] = perf_video_id
+            captured["playback_id"] = perf_video_id
+            return perf_video_id
+
+        page.wait_for_timeout(250)
+        waited += 0.25
 
     return "N/A"
-
-
 
 def probe_video_before_image(page, captured, max_seconds=VIDEO_PROBE_BEFORE_IMAGE_SECONDS):
     """
@@ -586,7 +618,7 @@ def probe_video_before_text(page, captured, max_seconds=VIDEO_PROBE_BEFORE_TEXT_
         return video_id
 
     # When a play/video hint is visible, activate only the real play target.
-    if has_video_hint(page):
+    if has_video_evidence(page, captured):
         click_possible_video_targets(page)
 
     remaining = max_seconds - (time.time() - started)
@@ -667,29 +699,38 @@ def navigate_with_retry(page, url, row_num, max_attempts=NAVIGATION_MAX_ATTEMPTS
 
 
 def get_immediate_video_id(page, captured):
-    """Fast ID lookup, trusting only the active player or validated direct-media IDs."""
-    # First query the current visible player. This prevents a stale request ID
-    # from another hidden creative winning.
-    video_id = extract_active_youtube_player_id(page)
-    if video_id != "N/A":
-        captured["video_id"] = video_id
-        return video_id
+    """
+    Fast final-ID lookup.
 
-    request_id = extract_validated_player_request_id(page, captured)
-    if request_id != "N/A":
-        captured["video_id"] = request_id
-        return request_id
+    YouTube: accepts ONLY the actual `videoplayback` request's `id=` value.
+    The visible YouTube player ID and youtubei player-request videoId are used
+    elsewhere only as evidence that the creative is a video.
+    """
+    playback_id = captured.get("playback_id")
+    if playback_id and playback_id != "N/A":
+        captured["video_id"] = playback_id
+        return playback_id
 
     captured_id = captured.get("video_id", "N/A")
     if captured_id and captured_id != "N/A":
-        return captured_id
+        # Reject 11-char YouTube metadata IDs as final Column-F values.
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(captured_id)):
+            return captured_id
 
     video_id = extract_video_from_dom(page)
     if video_id != "N/A":
+        captured["video_id"] = video_id
+        if extract_videoplayback_id(str(video_id)):
+            captured["playback_id"] = video_id
         return video_id
 
-    return scan_browser_performance_for_video(page)
+    video_id = scan_browser_performance_for_video(page)
+    if video_id != "N/A":
+        captured["video_id"] = video_id
+        captured["playback_id"] = video_id
+        return video_id
 
+    return "N/A"
 
 def has_video_hint(page):
     """Detect only visible player/video evidence. Hidden thumbnails do not count."""
@@ -741,6 +782,13 @@ def has_video_hint(page):
             continue
     return False
 
+def has_video_evidence(page, captured):
+    """Visible player evidence OR a YouTube/player/media request seen for this row."""
+    if captured.get("_video_evidence"):
+        return True
+    return has_video_hint(page)
+
+
 def detect_video_id(page, captured, max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS):
     """
     Bounded video detection.
@@ -754,7 +802,7 @@ def detect_video_id(page, captured, max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_
     if video_id != "N/A":
         return video_id
 
-    hint = has_video_hint(page)
+    hint = has_video_evidence(page, captured)
 
     # No video evidence: allow only a short network grace period.
     if not hint:
@@ -1991,7 +2039,7 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
 
             # If a real visible player/play surface is still present, do NOT
             # downgrade the creative to text just because its ad copy loaded first.
-            if has_video_hint(page):
+            if has_video_evidence(page, captured):
                 page.wait_for_timeout(500)
                 continue
 
@@ -2021,7 +2069,7 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
 
                 # Same protection for video creatives that visually look like
                 # a poster/image before playback exposes the ID.
-                if has_video_hint(page):
+                if has_video_evidence(page, captured):
                     page.wait_for_timeout(500)
                     continue
 
@@ -2043,7 +2091,7 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
             video_id = probe_video_before_text(page, captured)
             if video_id != "N/A":
                 return "video", video_id, "N/A", "N/A"
-        if not has_video_hint(page):
+        if not has_video_evidence(page, captured):
             return "text", "N/A", headline, description
 
     if has_visible_image_creative(page):
@@ -2051,13 +2099,22 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
             video_id = probe_video_before_image(page, captured)
             if video_id != "N/A":
                 return "video", video_id, "N/A", "N/A"
-        if not has_video_hint(page):
+        if not has_video_evidence(page, captured):
             return "image", "N/A", "N/A", "N/A"
 
     # Last-resort image fallback: only after video and text have both failed.
     # This restores image ads that use SVG/smaller/CSS artwork instead of a large raster.
-    if has_any_visible_image_creative(page) and not has_video_hint(page):
+    if has_any_visible_image_creative(page) and not has_video_evidence(page, captured):
         return "image", "N/A", "N/A", "N/A"
+
+    # A YouTube player/request was seen but the media request may have started late.
+    # Give ONLY these likely-video rows one final bounded chance to expose
+    # videoplayback?...&id=...; static text/image rows do not pay this cost.
+    if has_video_evidence(page, captured):
+        click_possible_video_targets(page)
+        video_id = wait_for_video_id(page, captured, max_seconds=8)
+        if video_id != "N/A":
+            return "video", video_id, "N/A", "N/A"
 
     return "unknown", "N/A", last_headline, last_description
 
@@ -2138,48 +2195,72 @@ def scrape_single_url(url_row):
             page = context.new_page()
             page.set_default_timeout(PLAYWRIGHT_ACTION_TIMEOUT_MS)
             page.set_default_navigation_timeout(60000)
-            captured = {"video_id": "N/A", "_youtube_player_requests": []}
+            captured = {"video_id": "N/A", "playback_id": "N/A", "_youtube_player_requests": [], "_video_evidence": False}
 
             def handle_request(request):
                 try:
                     request_url = str(request.url or "")
                     lower = request_url.lower()
 
-                    # Direct explicit IDs / direct video filenames are safe.
-                    found_id = extract_video_id_from_url(request_url)
-                    if found_id and captured.get("video_id", "N/A") == "N/A":
-                        captured["video_id"] = found_id
+                    # This is the exact ID requested by the user: the value of
+                    # `id=` on the actual videoplayback media request.
+                    playback_id = extract_videoplayback_id(request_url)
+                    if playback_id:
+                        captured["playback_id"] = playback_id
+                        captured["video_id"] = playback_id
+                        captured["_video_evidence"] = True
+                        return
 
-                    # For YouTube, retain the PLAYER REQUEST's top-level videoId
-                    # as a candidate. It is accepted later only if that request's
-                    # frame is still a visible real video player.
-                    if "youtubei/v1/player" in lower:
-                        try:
-                            player_id = extract_video_id_from_json_payload(request.post_data_json)
-                        except Exception:
-                            player_id = None
-                        if player_id:
-                            items = captured.setdefault("_youtube_player_requests", [])
-                            items.append((player_id, request.frame))
-                            if len(items) > 12:
-                                del items[:-12]
+                    # These URLs prove that this creative is likely a video, but
+                    # their IDs are NEVER written to Column F.
+                    if (
+                        "youtubei/v1/player" in lower
+                        or "youtube.com/embed/" in lower
+                        or "youtube-nocookie.com/embed/" in lower
+                        or "googlevideo.com" in lower
+                    ):
+                        captured["_video_evidence"] = True
+
+                    # Preserve non-YouTube direct-video filename behavior.
+                    if "youtube" not in lower and "googlevideo.com" not in lower:
+                        direct_id = extract_video_id_from_url(request_url)
+                        if direct_id:
+                            captured["video_id"] = direct_id
                 except Exception:
                     pass
 
             def handle_response(response):
                 try:
-                    # Player JSON, thumbnails and unrelated YouTube metadata are
-                    # deliberately ignored. Only actual media/direct URLs matter.
-                    if not is_real_video_response(response):
+                    response_url = str(response.url or "")
+                    playback_id = extract_videoplayback_id(response_url)
+                    if playback_id:
+                        # Always overwrite earlier metadata/direct candidates.
+                        # The media request is authoritative for Column F.
+                        captured["playback_id"] = playback_id
+                        captured["video_id"] = playback_id
+                        captured["_video_evidence"] = True
                         return
-                    found_id = extract_video_id_from_url(response.url)
-                    if found_id and captured.get("video_id", "N/A") == "N/A":
-                        captured["video_id"] = found_id
+
+                    if is_real_video_response(response):
+                        captured["_video_evidence"] = True
+                        direct_id = extract_video_id_from_url(response_url)
+                        if direct_id and "youtube" not in response_url.lower() and "googlevideo.com" not in response_url.lower():
+                            captured["video_id"] = direct_id
                 except Exception:
                     pass
 
+            # Page events cover the current transparency page and all of its frames.
             page.on("request", handle_request)
             page.on("response", handle_response)
+
+            # Context events also catch requests from popup/OOPIF player surfaces.
+            # Duplicate callbacks are harmless because the authoritative ID is
+            # simply assigned to the same captured value.
+            try:
+                context.on("request", handle_request)
+                context.on("response", handle_response)
+            except Exception:
+                pass
 
             if "region=" not in url:
                 separator = "&" if "?" in url else "?"
