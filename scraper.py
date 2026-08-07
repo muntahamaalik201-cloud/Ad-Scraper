@@ -2279,18 +2279,74 @@ def extract_text_ad_details_once(page):
     }
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
-    """Poll the fast text probe for a bounded amount of time."""
-    deadline = time.time() + max(0, max_wait_seconds)
+    """
+    Extracts headline and description for non-video ads.
+    - Prefers visible elements from the active creative (main DOM).
+    - Uses specific selectors: <div role="link">, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic
+    - Falls back to iframe if necessary.
+    - Relaxed visibility check to allow offscreen or special-language creatives (e.g., Arabic).
+    """
+    js = r"""
+    () => {
+        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
 
-    while True:
-        result = extract_text_ad_details_once(page)
-        if is_valid_text_ad(result.get("headline"), result.get("description")):
-            return result
+        // RELAXED visibility: ignore offscreen top/bottom/left/right but still require positive width/height
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+                   style.visibility !== 'hidden' &&
+                   style.display !== 'none' &&
+                   style.opacity !== '0';
+        };
 
-        if time.time() >= deadline:
-            return {"headline": "N/A", "description": "N/A"}
+        let headline = "N/A";
+        let description = "N/A";
 
-        page.wait_for_timeout(500)
+        // 1️⃣ Main visible creative first
+        const headlineEl = document.querySelector('div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
+        if (headlineEl && isVisible(headlineEl)) {
+            headline = cleanText(headlineEl.innerText || headlineEl.textContent);
+        }
+
+        const descriptionEl = document.querySelector('div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
+        if (descriptionEl && isVisible(descriptionEl)) {
+            description = cleanText(descriptionEl.innerText || descriptionEl.textContent);
+        }
+
+        return { headline, description };
+    }
+    """
+
+    def read_target(target):
+        try:
+            data = target.evaluate(js)
+            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
+                return data
+        except Exception:
+            return None
+        return None
+
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait_seconds:
+        # 1) Check main page DOM first (active visible creative)
+        data = read_target(page)
+        if data:
+            return data
+
+        # 2) Fallback: check iframes only if main DOM didn't yield headline/description
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            data = read_target(frame)
+            if data:
+                return data
+
+        page.wait_for_timeout(1000)
+
+    return {"headline": "N/A", "description": "N/A"}
 
 
 # =========================
@@ -2752,66 +2808,99 @@ def scrape_single_url(url_row):
                 return
 
             # =========================
-            # TEXT AD: column F = text
+            # TEXT AD: exact logic from the uploaded working reference
+            # Column F = text
             # =========================
-            if kind == "text" and is_valid_text_ad(headline, description):
-                print(f"📄 Row {row_num}: text ad found -> {headline}")
-                process_time = get_exact_time()
+            if kind == "text":
+                # Re-read text with the exact text-ad selectors/flow from the
+                # user's uploaded working scraper.  This does not touch video
+                # or image classification.
+                text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+                ref_headline = clean_text(text_data.get("headline"))
+                ref_description = clean_text(text_data.get("description"))
 
-                visible_app_link = wait_and_extract_install_link(
-                    page,
-                    max_wait_seconds=5,
-                )
+                if is_valid_text_ad(ref_headline, ref_description):
+                    headline = ref_headline
+                    description = ref_description
 
-                package_name, app_link, match_score, package_source = resolve_text_ad_package(
-                    page,
-                    captured,
-                    headline,
-                    description,
-                    visible_app_link,
-                )
+                if is_valid_text_ad(headline, description):
+                    print(f"📄 Row {row_num}: text ad found -> {headline}")
+                    process_time = get_exact_time()
 
-                if package_name:
-                    status = "SUCCESS"
-                    message = (
-                        f"Text ad package resolved from {package_source}; "
-                        f"score={match_score}"
+                    # EXACT reference flow: visible install link first.
+                    visible_app_link = wait_and_extract_install_link(
+                        page,
+                        max_wait_seconds=8,
                     )
-                    print(
-                        f"📦 Row {row_num}: text package -> {package_name} "
-                        f"({package_source})"
-                    )
-                else:
-                    package_name = "N/A"
-                    app_link = "N/A"
-                    status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = (
-                        "Text ad found, but package could not be resolved. "
-                        f"Best score={match_score}"
-                    )
+                    visible_package = extract_package_name(visible_app_link)
 
-                data = [
-                    advertiser,
-                    package_name,
-                    url,
-                    app_link,
-                    process_time,
-                    "text",
-                    process_time,
-                ]
-                safe_update_combined_row(row_num, data)
-                safe_update_headline_desc(row_num, headline, description)
-                safe_add_log(
-                    row_number=row_num,
-                    status=status,
-                    log_type="TEXT_AD",
-                    url=url,
-                    video_id="text",
-                    app_link=app_link,
-                    message=message,
-                )
-                print(f"✅ Row {row_num}: saved TEXT ad")
-                return
+                    if visible_package != "N/A":
+                        package_name = visible_package
+                        app_link = visible_app_link
+                        match_score = 1.0
+                        status = "SUCCESS"
+                        message = "Non-video text ad package extracted from visible install link"
+                        print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
+                    else:
+                        # EXACT reference fallback: scan rendered DOM/links, then
+                        # strictly match package against visible headline + description.
+                        print(
+                            f"📦 Row {row_num}: visible install link not found, "
+                            "strict matching with headline + description"
+                        )
+                        all_found_packages = extract_package_from_page(page)
+                        package_name, match_score = get_best_matching_package(
+                            headline,
+                            description,
+                            all_found_packages,
+                        )
+
+                        if package_name:
+                            app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                            status = "SUCCESS"
+                            message = (
+                                "Non-video text ad package strictly matched "
+                                f"with score {match_score}"
+                            )
+                            print(
+                                f"✅ Row {row_num}: strict matched package -> "
+                                f"{package_name} | score={match_score}"
+                            )
+                        else:
+                            package_name = "N/A"
+                            app_link = "N/A"
+                            status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+                            message = (
+                                "Non-video text ad found, but package score below 0.76. "
+                                f"Best score={match_score}"
+                            )
+                            print(
+                                f"⚠️ Row {row_num}: package score below 0.76, "
+                                f"writing N/A | best score={match_score}"
+                            )
+
+                    data = [
+                        advertiser,
+                        package_name,
+                        url,
+                        app_link,
+                        process_time,
+                        "text",
+                        process_time,
+                    ]
+                    safe_update_combined_row(row_num, data)
+                    safe_update_headline_desc(row_num, headline, description)
+                    safe_add_log(
+                        row_number=row_num,
+                        status=status,
+                        log_type="TEXT_AD",
+                        url=url,
+                        video_id="text",
+                        app_link=app_link,
+                        message=message,
+                    )
+                    print(f"✅ Row {row_num}: saved TEXT ad")
+                    return
 
             # No supported creative could be verified. Keep the old N/A behavior.
             process_time = get_exact_time()
