@@ -1,5 +1,5 @@
 # Combined Google Ads Transparency scraper
-# V8: preserve V6 text/image logic; validate YouTube IDs from the active visible player only.
+# V11: preserve V10 video/text/image logic; restore robust text-ad package extraction.
 # Video-ad detection logic is kept from the original scrapper.txt.
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
 
@@ -1368,6 +1368,139 @@ def extract_packages_from_text(raw_text):
 
     return candidates
 
+def extract_packages_from_url_recursive(raw_value, max_depth=4):
+    """
+    Extract Android package names from a URL even when the Play Store URL is
+    nested/encoded inside a Google Ads click URL.
+
+    TEXT-AD PACKAGE RESOLUTION ONLY.  This does not change ad classification.
+    """
+    if not raw_value or raw_value == "N/A":
+        return set()
+
+    found = set()
+    queue = [str(raw_value)]
+    seen = set()
+
+    for _ in range(max_depth):
+        if not queue:
+            break
+
+        next_queue = []
+        for value in queue:
+            if not value or value in seen:
+                continue
+            seen.add(value)
+
+            # Try both the original and repeatedly URL-decoded forms.
+            variants = [value]
+            decoded = value
+            for _decode_round in range(3):
+                try:
+                    new_decoded = unquote(decoded)
+                except Exception:
+                    break
+                if not new_decoded or new_decoded == decoded:
+                    break
+                variants.append(new_decoded)
+                decoded = new_decoded
+
+            for variant in variants:
+                try:
+                    found.update(extract_packages_from_text(variant))
+                except Exception:
+                    pass
+
+                # Follow nested destination/adurl/url query values without
+                # making any network request or clicking the ad.
+                try:
+                    parsed = urlparse(variant)
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    for values in query.values():
+                        for nested in values:
+                            if nested and nested not in seen:
+                                next_queue.append(str(nested))
+                except Exception:
+                    pass
+
+        queue = next_queue
+
+    return found
+
+
+def resolve_text_ad_package(page, captured, headline, description, visible_app_link):
+    """
+    Resolve package name for TEXT ads only.
+
+    Priority:
+      1) Direct Play/App Store link package.
+      2) Package embedded inside the visible install/googleadservices URL.
+      3) Package seen in this ad's network URLs.
+      4) Existing rendered-DOM package extraction + existing strict matcher.
+
+    Returns: (package_name_or_None, app_link, match_score, source)
+    """
+    direct_package = extract_package_name(visible_app_link)
+    if direct_package != "N/A":
+        return direct_package, visible_app_link, 1.0, "visible_install_link"
+
+    visible_candidates = extract_packages_from_url_recursive(visible_app_link)
+    if len(visible_candidates) == 1:
+        package_name = next(iter(visible_candidates))
+        return (
+            package_name,
+            f"https://play.google.com/store/apps/details?id={package_name}",
+            1.0,
+            "encoded_visible_install_link",
+        )
+
+    network_candidates = set(captured.get("_package_candidates", set()) or set())
+
+    # If the active text ad exposed exactly one package in its network traffic,
+    # it is stronger than guessing from headline text alone.
+    if len(network_candidates) == 1:
+        package_name = next(iter(network_candidates))
+        return (
+            package_name,
+            f"https://play.google.com/store/apps/details?id={package_name}",
+            1.0,
+            "text_ad_network",
+        )
+
+    page_candidates = set(extract_package_from_page(page) or set())
+    all_candidates = set()
+    all_candidates.update(visible_candidates)
+    all_candidates.update(network_candidates)
+    all_candidates.update(page_candidates)
+
+    package_name, match_score = get_best_matching_package(
+        headline,
+        description,
+        all_candidates,
+    )
+    if package_name:
+        return (
+            package_name,
+            f"https://play.google.com/store/apps/details?id={package_name}",
+            match_score,
+            "strict_text_match",
+        )
+
+    # Text-only final fallback: if all active sources agree on one package,
+    # keep it even when the visible ad wording does not resemble the package ID.
+    # This does NOT run for image ads.
+    if len(all_candidates) == 1:
+        package_name = next(iter(all_candidates))
+        return (
+            package_name,
+            f"https://play.google.com/store/apps/details?id={package_name}",
+            1.0,
+            "single_text_candidate",
+        )
+
+    return None, "N/A", match_score, "not_found"
+
+
 def extract_package_from_page(page):
     """
     Scans strictly the rendered DOM and visible links. 
@@ -2195,12 +2328,22 @@ def scrape_single_url(url_row):
             page = context.new_page()
             page.set_default_timeout(PLAYWRIGHT_ACTION_TIMEOUT_MS)
             page.set_default_navigation_timeout(60000)
-            captured = {"video_id": "N/A", "playback_id": "N/A", "_youtube_player_requests": [], "_video_evidence": False}
+            captured = {"video_id": "N/A", "playback_id": "N/A", "_youtube_player_requests": [], "_video_evidence": False, "_package_candidates": set()}
 
             def handle_request(request):
                 try:
                     request_url = str(request.url or "")
                     lower = request_url.lower()
+
+                    # Text-ad package candidates are collected passively from
+                    # network URLs.  They are used ONLY if the creative is later
+                    # classified as text.
+                    try:
+                        captured["_package_candidates"].update(
+                            extract_packages_from_url_recursive(request_url)
+                        )
+                    except Exception:
+                        pass
 
                     # This is the exact ID requested by the user: the value of
                     # `id=` on the actual videoplayback media request.
@@ -2232,6 +2375,13 @@ def scrape_single_url(url_row):
             def handle_response(response):
                 try:
                     response_url = str(response.url or "")
+                    try:
+                        captured["_package_candidates"].update(
+                            extract_packages_from_url_recursive(response_url)
+                        )
+                    except Exception:
+                        pass
+
                     playback_id = extract_videoplayback_id(response_url)
                     if playback_id:
                         # Always overwrite earlier metadata/direct candidates.
@@ -2345,33 +2495,33 @@ def scrape_single_url(url_row):
                     page,
                     max_wait_seconds=5,
                 )
-                visible_package = extract_package_name(visible_app_link)
 
-                if visible_package != "N/A":
-                    package_name = visible_package
-                    app_link = visible_app_link
+                package_name, app_link, match_score, package_source = resolve_text_ad_package(
+                    page,
+                    captured,
+                    headline,
+                    description,
+                    visible_app_link,
+                )
+
+                if package_name:
                     status = "SUCCESS"
-                    message = "Text ad package extracted from visible install link"
-                else:
-                    all_found_packages = extract_package_from_page(page)
-                    package_name, match_score = get_best_matching_package(
-                        headline,
-                        description,
-                        all_found_packages,
+                    message = (
+                        f"Text ad package resolved from {package_source}; "
+                        f"score={match_score}"
                     )
-
-                    if package_name:
-                        app_link = f"https://play.google.com/store/apps/details?id={package_name}"
-                        status = "SUCCESS"
-                        message = f"Text ad package strictly matched with score {match_score}"
-                    else:
-                        package_name = "N/A"
-                        app_link = "N/A"
-                        status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                        message = (
-                            "Text ad found, but package score below 0.76. "
-                            f"Best score={match_score}"
-                        )
+                    print(
+                        f"📦 Row {row_num}: text package -> {package_name} "
+                        f"({package_source})"
+                    )
+                else:
+                    package_name = "N/A"
+                    app_link = "N/A"
+                    status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+                    message = (
+                        "Text ad found, but package could not be resolved. "
+                        f"Best score={match_score}"
+                    )
 
                 data = [
                     advertiser,
