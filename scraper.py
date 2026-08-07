@@ -1,5 +1,5 @@
-# V7: strict active-video ID extraction; visible player only; no hidden/itag IDs.
 # Combined Google Ads Transparency scraper
+# V8: preserve V6 text/image logic; validate YouTube IDs from the active visible player only.
 # Video-ad detection logic is kept from the original scrapper.txt.
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
 
@@ -161,17 +161,12 @@ def extract_package_name(app_link):
 # VIDEO ID LOGIC (REVERTED TO YOUR ORIGINAL WORKING LOGIC)
 # =========================
 
-def is_real_video_response(response):
-    """Return True only for an actual video/media response.
 
-    IMPORTANT: thumbnails, player JSON and generic YouTube page resources are
-    intentionally NOT treated as a video ID source. They can belong to hidden
-    or stale creatives in the Transparency page.
-    """
+def is_real_video_response(response):
+    """True only for an actual media response, never for thumbnails/player JSON."""
     try:
-        url = response.url.lower()
-        headers = response.headers
-        content_type = headers.get("content-type", "").lower()
+        url = str(response.url or "").lower()
+        content_type = str(response.headers.get("content-type", "") or "").lower()
 
         if content_type.startswith("video/"):
             return True
@@ -189,11 +184,13 @@ def is_real_video_response(response):
 
 
 def extract_video_id_from_url(req_url):
-    """Extract only a defensible video identifier from a URL.
+    """
+    Extract a video ID only when the URL itself explicitly identifies the video.
 
-    For YouTube, only an explicit 11-character video ID is accepted. Query
-    parameters such as itag, ei and source are playback metadata and are never
-    returned as video IDs.
+    IMPORTANT:
+    - YouTube thumbnails are NOT accepted here.
+    - videoplayback id/itag/ei/source are NOT accepted as YouTube video IDs.
+    - The active YouTube player is queried separately for its real 11-char ID.
     """
     try:
         raw_url = str(req_url or "")
@@ -201,33 +198,28 @@ def extract_video_id_from_url(req_url):
         parsed = urlparse(raw_url)
         query = parse_qs(parsed.query)
 
-        youtube_patterns = [
+        patterns = [
             r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]{11})",
             r"youtube\.com/shorts/([A-Za-z0-9_-]{11})",
             r"youtube\.com/v/([A-Za-z0-9_-]{11})",
             r"youtu\.be/([A-Za-z0-9_-]{11})",
         ]
-        for pattern in youtube_patterns:
+        for pattern in patterns:
             match = re.search(pattern, raw_url, re.IGNORECASE)
             if match:
                 return match.group(1)
 
         if "youtube.com/watch" in url_lower:
-            video_id = query.get("v", [None])[0]
-            if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-                return video_id
+            value = query.get("v", [None])[0]
+            if value and re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+                return value
 
-        # Media URLs sometimes expose an explicit YouTube ID. Accept only named
-        # video_id/videoid/docid fields. The generic id parameter is not trusted.
-        # Never use id/itag/ei/source as the saved YouTube video ID.
+        # A googlevideo/videoplayback URL proves video activity but its `id`
+        # parameter is often a playback identifier, not the public YouTube ID.
         if "videoplayback" in url_lower or "googlevideo.com" in url_lower:
-            for key in ("video_id", "videoid", "docid"):
-                value = query.get(key, [None])[0]
-                if value and re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
-                    return value
             return None
 
-        # Preserve the existing behavior for direct non-YouTube video files.
+        # Preserve direct-file behavior for non-YouTube hosted videos.
         for ext in VIDEO_EXTENSIONS:
             if ext in url_lower:
                 filename = parsed.path.split("/")[-1].split("?")[0].strip()
@@ -240,194 +232,222 @@ def extract_video_id_from_url(req_url):
 
 
 def extract_video_id_from_json_payload(payload):
-    """Extract the requested YouTube videoId from a PLAYER REQUEST only.
-
-    Do not recursively scan response JSON: player responses can contain other
-    video IDs unrelated to the currently displayed creative.
-    """
+    """Read only the top-level videoId from a YouTube PLAYER REQUEST."""
     try:
         if isinstance(payload, dict):
-            value = payload.get("videoId") or payload.get("video_id")
-            if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
-                return value
+            for key in ("videoId", "video_id"):
+                value = payload.get(key)
+                if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+                    return value
     except Exception:
         pass
     return None
 
 
-def _video_frame_is_visible(frame, page):
-    """True when a child frame belongs to a visible creative/player surface."""
+def _frame_visible_for_video(frame, page, min_width=80, min_height=45):
+    """Check that a frame is actually rendered as part of the current creative."""
     try:
         if frame == page.main_frame:
             return False
-        el = frame.frame_element()
-        box = el.bounding_box(timeout=1200)
+        element = frame.frame_element()
+        box = element.bounding_box(timeout=1200)
         if not box:
             return False
-        width = box.get("width", 0) or 0
-        height = box.get("height", 0) or 0
-        y = box.get("y", 99999) or 99999
-        return width >= 80 and height >= 45 and -150 <= y <= 1400
+        return (box.get("width", 0) or 0) >= min_width and (box.get("height", 0) or 0) >= min_height
     except Exception:
         return False
 
 
-def scan_embedded_video_metadata(page):
-    """Scan only URLs of visible player frames.
-
-    Hidden HTML/template metadata is deliberately ignored because it was the
-    main source of unrelated YouTube IDs.
-    """
-    for frame in page.frames:
-        if not _video_frame_is_visible(frame, page):
-            continue
-        try:
-            found = extract_video_id_from_url(frame.url)
-            if found:
-                return found
-        except Exception:
-            continue
-    return "N/A"
-
-
-def extract_visible_youtube_poster_id(page):
-    """Return a YouTube ID only from a visible VIDEO poster in the active creative.
-
-    A ytimg thumbnail by itself is not enough. The same visible creative frame
-    must also contain a visible play/player control, which prevents unrelated
-    thumbnails or hidden templates from becoming the saved video ID.
-    """
+def _frame_has_video_player(frame):
+    """Require a real player/video surface before trusting IDs inside a frame."""
     js = r"""
     () => {
-        const visible = (el, minW=20, minH=20) => {
+        const visible = (el) => {
             if (!el) return false;
             const r = el.getBoundingClientRect();
             const s = window.getComputedStyle(el);
-            return r.width >= minW && r.height >= minH &&
-                   s.display !== 'none' && s.visibility !== 'hidden' &&
-                   s.opacity !== '0';
+            return r.width >= 80 && r.height >= 45 &&
+                   s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
         };
 
-        let hasPlay = false;
-        for (const el of document.querySelectorAll('video, button, [role="button"], [aria-label], [title]')) {
-            if (!visible(el)) continue;
-            const tag = String(el.tagName || '').toLowerCase();
+        const player = document.querySelector('#movie_player, .html5-video-player, [class*="video-player"], [class*="videoplayer"]');
+        if (player && visible(player)) return true;
+
+        if (Array.from(document.querySelectorAll('video')).some(visible)) return true;
+
+        return Array.from(document.querySelectorAll('button, [role="button"], [aria-label], [title]')).some(el => {
+            if (!visible(el)) return false;
             const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
             const title = String(el.getAttribute('title') || '').toLowerCase();
             const cls = String(el.className || '').toLowerCase();
-            const txt = String(el.innerText || el.textContent || '').trim().toLowerCase();
-            if (tag === 'video' || aria.includes('play') || title.includes('play') ||
-                cls.includes('play-button') || cls.includes('playbutton') ||
-                cls.includes('video-player') || cls.includes('videoplayer') ||
-                txt === 'play') {
-                hasPlay = true;
-                break;
-            }
-        }
-        if (!hasPlay) return [];
+            return aria.includes('play') || title.includes('play') || cls.includes('play-button') || cls.includes('playbutton');
+        });
+    }
+    """
+    try:
+        return bool(frame.evaluate(js))
+    except Exception:
+        return False
 
-        const values = [];
-        for (const el of document.querySelectorAll('img[src], [poster]')) {
-            if (!visible(el, 120, 70)) continue;
-            const r = el.getBoundingClientRect();
-            if ((r.width * r.height) < 20000) continue;
-            const value = String(el.src || el.poster || el.getAttribute('src') || el.getAttribute('poster') || '');
-            if (/ytimg\.com\/(?:vi|vi_webp)\/[A-Za-z0-9_-]{11}/i.test(value) ||
-                /img\.youtube\.com\/(?:vi|vi_webp)\/[A-Za-z0-9_-]{11}/i.test(value)) {
-                values.push(value);
+
+def extract_active_youtube_player_id(page):
+    """
+    Get the YouTube ID from the ACTIVE visible player only.
+
+    This is the authoritative YouTube-ID path. It avoids unrelated thumbnails,
+    hidden templates and recursive player-response metadata.
+    """
+    js = r"""
+    () => {
+        const valid = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{11}$/.test(v);
+
+        try {
+            const player = document.querySelector('#movie_player');
+            if (player && typeof player.getVideoData === 'function') {
+                const data = player.getVideoData();
+                if (data && valid(data.video_id)) return data.video_id;
             }
+        } catch (e) {}
+
+        try {
+            const r = window.ytInitialPlayerResponse;
+            if (r && r.videoDetails && valid(r.videoDetails.videoId)) return r.videoDetails.videoId;
+        } catch (e) {}
+
+        try {
+            const args = window.ytplayer && window.ytplayer.config && window.ytplayer.config.args;
+            if (args && valid(args.video_id)) return args.video_id;
+        } catch (e) {}
+
+        // Poster/thumbnail is accepted ONLY inside this already-verified visible player frame.
+        for (const el of document.querySelectorAll('video[poster], img[src]')) {
+            const value = String(el.poster || el.src || el.getAttribute('poster') || el.getAttribute('src') || '');
+            const m = value.match(/(?:i\.ytimg\.com|img\.youtube\.com)\/(?:vi|vi_webp)\/([A-Za-z0-9_-]{11})/i);
+            if (m) return m[1];
         }
-        return values;
+
+        return null;
     }
     """
 
+    # Prefer explicit YouTube player frames, then any visible frame with a real video surface.
+    candidates = []
     for frame in page.frames:
-        if not _video_frame_is_visible(frame, page):
+        if not _frame_visible_for_video(frame, page):
             continue
+        url = str(frame.url or '').lower()
+        priority = 0 if ('youtube.com' in url or 'youtube-nocookie.com' in url) else 1
+        candidates.append((priority, frame))
+
+    candidates.sort(key=lambda x: x[0])
+
+    for _, frame in candidates:
         try:
-            values = frame.evaluate(js) or []
-            for value in values:
-                match = re.search(
-                    r'(?:i\.ytimg\.com|img\.youtube\.com)/(?:vi|vi_webp)/([A-Za-z0-9_-]{11})',
-                    str(value), re.IGNORECASE
-                )
-                if match:
-                    return match.group(1)
+            explicit = extract_video_id_from_url(frame.url)
+            if explicit:
+                return explicit
+        except Exception:
+            pass
+
+        if not _frame_has_video_player(frame):
+            continue
+
+        try:
+            value = frame.evaluate(js)
+            if value and re.fullmatch(r"[A-Za-z0-9_-]{11}", str(value)):
+                return str(value)
+        except Exception:
+            continue
+
+    return "N/A"
+
+
+def extract_validated_player_request_id(page, captured):
+    """Use a player-request videoId only if its originating frame is still a visible video player."""
+    candidates = captured.get("_youtube_player_requests", []) or []
+    for video_id, frame in reversed(candidates):
+        try:
+            if frame not in page.frames:
+                continue
+            if not _frame_visible_for_video(frame, page):
+                continue
+            if not _frame_has_video_player(frame):
+                continue
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", str(video_id)):
+                return str(video_id)
         except Exception:
             continue
     return "N/A"
 
 
+def scan_embedded_video_metadata(page):
+    """Only inspect the active visible player; never scan arbitrary page HTML."""
+    return extract_active_youtube_player_id(page)
+
+
 def extract_video_from_dom(page):
-    """Read IDs only from the visible active player/video DOM."""
+    """Read video IDs only from visible player/video DOM."""
+    youtube_id = extract_active_youtube_player_id(page)
+    if youtube_id != "N/A":
+        return youtube_id
+
     for frame in page.frames:
-        if frame != page.main_frame and not _video_frame_is_visible(frame, page):
+        if frame != page.main_frame and not _frame_visible_for_video(frame, page):
             continue
-
         try:
-            frame_id = extract_video_id_from_url(frame.url)
-            if frame_id:
-                return frame_id
-        except Exception:
-            pass
-
-        try:
-            urls = frame.evaluate("""
+            urls = frame.evaluate(r"""
                 () => {
                     const visible = (el) => {
                         if (!el) return false;
                         const r = el.getBoundingClientRect();
                         const s = window.getComputedStyle(el);
                         return r.width > 0 && r.height > 0 &&
-                               s.display !== 'none' &&
-                               s.visibility !== 'hidden' &&
-                               s.opacity !== '0';
+                               s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
                     };
                     return Array.from(document.querySelectorAll('video, source, iframe'))
                         .filter(el => el.tagName.toLowerCase() === 'source' || visible(el))
-                        .flatMap(el => [
-                            el.currentSrc || '',
-                            el.src || '',
-                            el.getAttribute('src') || ''
-                        ])
+                        .flatMap(el => [el.currentSrc || '', el.src || '', el.getAttribute('src') || ''])
                         .filter(Boolean);
                 }
             """)
             for src in urls:
-                video_id = extract_video_id_from_url(str(src))
-                if video_id:
-                    return video_id
+                found = extract_video_id_from_url(str(src))
+                if found:
+                    return found
         except Exception:
             continue
-
-    poster_id = extract_visible_youtube_poster_id(page)
-    if poster_id != "N/A":
-        return poster_id
 
     return "N/A"
 
 
 def scan_browser_performance_for_video(page):
-    """Scan resources only inside visible creative/player frames."""
-    targets = [
-        frame for frame in page.frames
-        if frame != page.main_frame and _video_frame_is_visible(frame, page)
-    ]
+    """Use resource entries as video evidence, but get YouTube ID from the active player."""
+    saw_youtube_media = False
 
-    for target in targets:
+    for frame in page.frames:
+        if frame == page.main_frame or not _frame_visible_for_video(frame, page):
+            continue
         try:
-            urls = target.evaluate("""
-                () => performance.getEntriesByType('resource').map(r => r.name)
-            """)
+            urls = frame.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
             for u in urls:
-                video_id = extract_video_id_from_url(str(u))
-                if video_id:
-                    return video_id
+                u = str(u)
+                lower = u.lower()
+
+                direct_id = extract_video_id_from_url(u)
+                if direct_id:
+                    return direct_id
+
+                if "videoplayback" in lower or "googlevideo.com" in lower:
+                    saw_youtube_media = True
         except Exception:
             continue
 
-    return "N/A"
+    if saw_youtube_media:
+        found = extract_active_youtube_player_id(page)
+        if found != "N/A":
+            return found
 
+    return "N/A"
 
 def click_possible_video_targets(page):
     """
@@ -645,8 +665,21 @@ def navigate_with_retry(page, url, row_num, max_attempts=NAVIGATION_MAX_ATTEMPTS
     raise TransientHTTPError(None, url, str(last_error))
 
 
+
 def get_immediate_video_id(page, captured):
-    """No-wait video check using responses, DOM, frame URLs, metadata and performance."""
+    """Fast ID lookup, trusting only the active player or validated direct-media IDs."""
+    # First query the current visible player. This prevents a stale request ID
+    # from another hidden creative winning.
+    video_id = extract_active_youtube_player_id(page)
+    if video_id != "N/A":
+        captured["video_id"] = video_id
+        return video_id
+
+    request_id = extract_validated_player_request_id(page, captured)
+    if request_id != "N/A":
+        captured["video_id"] = request_id
+        return request_id
+
     captured_id = captured.get("video_id", "N/A")
     if captured_id and captured_id != "N/A":
         return captured_id
@@ -655,80 +688,58 @@ def get_immediate_video_id(page, captured):
     if video_id != "N/A":
         return video_id
 
-    # Throttle the heavier HTML metadata scan while classification polls.
-    now = time.time()
-    if now - captured.get("_last_metadata_scan", 0) >= 1.0:
-        captured["_last_metadata_scan"] = now
-        video_id = scan_embedded_video_metadata(page)
-        if video_id != "N/A":
-            return video_id
-
     return scan_browser_performance_for_video(page)
 
 
 def has_video_hint(page):
-    """Detect play/player evidence without changing non-video classification logic."""
+    """Detect only visible player/video evidence. Hidden thumbnails do not count."""
+    # An actual active YouTube player is the strongest hint.
+    if extract_active_youtube_player_id(page) != "N/A":
+        return True
+
     js = r"""
     () => {
         const visible = (el) => {
             if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 20 && rect.height > 20 &&
-                   style.display !== 'none' &&
-                   style.visibility !== 'hidden' &&
-                   style.opacity !== '0';
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 20 && r.height > 20 &&
+                   s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
         };
 
         if (Array.from(document.querySelectorAll('video')).some(visible)) return true;
 
-        for (const el of document.querySelectorAll('iframe[src], img[src], [poster], a[href]')) {
-            const value = String(
-                el.src || el.href || el.poster ||
-                el.getAttribute('src') || el.getAttribute('href') ||
-                el.getAttribute('poster') || ''
-            ).toLowerCase();
-            if (
-                value.includes('youtube') || value.includes('youtu.be') ||
-                value.includes('ytimg.com/vi/') || value.includes('ytimg.com/vi_webp/') ||
-                value.includes('videoplayback') || value.includes('googlevideo.com') ||
-                value.includes('.mp4') || value.includes('.webm') ||
-                value.includes('.m3u8')
-            ) return true;
+        for (const el of document.querySelectorAll('iframe[src]')) {
+            if (!visible(el)) continue;
+            const value = String(el.src || el.getAttribute('src') || '').toLowerCase();
+            if (value.includes('youtube.com/embed/') || value.includes('youtube-nocookie.com/embed/')) return true;
         }
 
-        const candidates = document.querySelectorAll(
-            'button, [role="button"], [aria-label], [title], source[type]'
-        );
-
-        for (const el of candidates) {
+        for (const el of document.querySelectorAll('button, [role="button"], [aria-label], [title], source[type]')) {
             const tag = String(el.tagName || '').toLowerCase();
             const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
             const title = String(el.getAttribute('title') || '').toLowerCase();
             const cls = String(el.className || '').toLowerCase();
             const type = String(el.getAttribute('type') || '').toLowerCase();
-            const text = String(el.innerText || el.textContent || '').trim().toLowerCase();
+            const txt = String(el.innerText || el.textContent || '').trim().toLowerCase();
             if (type.startsWith('video/')) return true;
             if (!visible(el) && tag !== 'source') continue;
-
             if (aria.includes('play') || title.includes('play') ||
                 cls.includes('play-button') || cls.includes('playbutton') ||
                 cls.includes('video-player') || cls.includes('videoplayer') ||
-                text === 'play') return true;
+                txt === 'play') return true;
         }
         return false;
     }
     """
 
-    targets = [page] + [frame for frame in page.frames if frame != page.main_frame]
-    for target in targets:
+    for target in [page] + [f for f in page.frames if f != page.main_frame]:
         try:
             if target.evaluate(js):
                 return True
         except Exception:
             continue
     return False
-
 
 def detect_video_id(page, captured, max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS):
     """
@@ -1902,6 +1913,53 @@ def has_visible_image_creative(page):
     return False
 
 
+
+def has_any_visible_image_creative(page):
+    """Final fallback for image creatives that use smaller images/SVG/CSS artwork."""
+    js = r"""
+    () => {
+        const visible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width >= 120 && r.height >= 80 &&
+                   r.bottom > 0 && r.right > 0 &&
+                   s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+        };
+
+        for (const el of document.querySelectorAll('img, picture, canvas, svg')) {
+            if (!visible(el)) continue;
+            const src = String(el.getAttribute('src') || '').toLowerCase();
+            const alt = String(el.getAttribute('alt') || '').toLowerCase();
+            if (src.includes('googlelogo') || alt.includes('google')) continue;
+            return true;
+        }
+
+        for (const el of document.querySelectorAll('div, a, section')) {
+            if (!visible(el)) continue;
+            const bg = String(window.getComputedStyle(el).backgroundImage || '');
+            if (bg && bg !== 'none' && bg.includes('url(') && !bg.toLowerCase().includes('googlelogo')) return true;
+        }
+        return false;
+    }
+    """
+
+    # Creative frames only; do not classify Google Transparency shell artwork as an ad.
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            box = _frame_parent_box(frame)
+            if not box:
+                continue
+            if (box.get('width', 0) or 0) < 100 or (box.get('height', 0) or 0) < 60:
+                continue
+            if frame.evaluate(js):
+                return True
+        except Exception:
+            continue
+    return False
+
 def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT_SECONDS):
     """Return (kind, video_id, headline, description) with video checked before text."""
     deadline = time.time() + max_wait_seconds
@@ -1930,6 +1988,13 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
                 video_id = probe_video_before_text(page, captured)
                 if video_id != "N/A":
                     return "video", video_id, "N/A", "N/A"
+
+            # If a real visible player/play surface is still present, do NOT
+            # downgrade the creative to text just because its ad copy loaded first.
+            if has_video_hint(page):
+                page.wait_for_timeout(500)
+                continue
+
             return "text", "N/A", headline, description
 
         image_like = has_visible_image_creative(page)
@@ -1954,6 +2019,12 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
                                 return "video", video_id, "N/A", "N/A"
                         return "text", "N/A", headline, description
 
+                # Same protection for video creatives that visually look like
+                # a poster/image before playback exposes the ID.
+                if has_video_hint(page):
+                    page.wait_for_timeout(500)
+                    continue
+
                 return "image", "N/A", "N/A", "N/A"
         else:
             first_image_seen_at = None
@@ -1972,13 +2043,20 @@ def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT
             video_id = probe_video_before_text(page, captured)
             if video_id != "N/A":
                 return "video", video_id, "N/A", "N/A"
-        return "text", "N/A", headline, description
+        if not has_video_hint(page):
+            return "text", "N/A", headline, description
 
     if has_visible_image_creative(page):
         if not video_probe_done:
             video_id = probe_video_before_image(page, captured)
             if video_id != "N/A":
                 return "video", video_id, "N/A", "N/A"
+        if not has_video_hint(page):
+            return "image", "N/A", "N/A", "N/A"
+
+    # Last-resort image fallback: only after video and text have both failed.
+    # This restores image ads that use SVG/smaller/CSS artwork instead of a large raster.
+    if has_any_visible_image_creative(page) and not has_video_hint(page):
         return "image", "N/A", "N/A", "N/A"
 
     return "unknown", "N/A", last_headline, last_description
@@ -2060,44 +2138,39 @@ def scrape_single_url(url_row):
             page = context.new_page()
             page.set_default_timeout(PLAYWRIGHT_ACTION_TIMEOUT_MS)
             page.set_default_navigation_timeout(60000)
-            captured = {"video_id": "N/A"}
+            captured = {"video_id": "N/A", "_youtube_player_requests": []}
+
             def handle_request(request):
                 try:
-                    if captured.get("video_id", "N/A") != "N/A":
-                        return
+                    request_url = str(request.url or "")
+                    lower = request_url.lower()
 
-                    # Ignore requests coming from the Transparency shell or a
-                    # hidden/stale frame. Only the visible creative/player may
-                    # supply the saved video ID.
-                    if not _video_frame_is_visible(request.frame, page):
-                        return
-
-                    request_url = request.url
+                    # Direct explicit IDs / direct video filenames are safe.
                     found_id = extract_video_id_from_url(request_url)
-
-                    # YouTube player API: use only the top-level videoId from
-                    # the REQUEST body. Do not inspect response JSON.
-                    if not found_id and "youtubei/v1/player" in request_url.lower():
-                        try:
-                            found_id = extract_video_id_from_json_payload(request.post_data_json)
-                        except Exception:
-                            found_id = None
-
                     if found_id and captured.get("video_id", "N/A") == "N/A":
                         captured["video_id"] = found_id
+
+                    # For YouTube, retain the PLAYER REQUEST's top-level videoId
+                    # as a candidate. It is accepted later only if that request's
+                    # frame is still a visible real video player.
+                    if "youtubei/v1/player" in lower:
+                        try:
+                            player_id = extract_video_id_from_json_payload(request.post_data_json)
+                        except Exception:
+                            player_id = None
+                        if player_id:
+                            items = captured.setdefault("_youtube_player_requests", [])
+                            items.append((player_id, request.frame))
+                            if len(items) > 12:
+                                del items[:-12]
                 except Exception:
                     pass
 
             def handle_response(response):
                 try:
-                    if captured.get("video_id", "N/A") != "N/A":
-                        return
+                    # Player JSON, thumbnails and unrelated YouTube metadata are
+                    # deliberately ignored. Only actual media/direct URLs matter.
                     if not is_real_video_response(response):
-                        return
-                    try:
-                        if not _video_frame_is_visible(response.request.frame, page):
-                            return
-                    except Exception:
                         return
                     found_id = extract_video_id_from_url(response.url)
                     if found_id and captured.get("video_id", "N/A") == "N/A":
