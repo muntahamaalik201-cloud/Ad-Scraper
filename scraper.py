@@ -1,13 +1,11 @@
 # Combined Google Ads Transparency scraper
-# V8: preserve V6 text/image logic; validate YouTube IDs from the active visible player only.
 # Video-ad detection logic is kept from the original scrapper.txt.
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from zoneinfo import ZoneInfo
 import difflib
 import re
 
@@ -44,17 +42,6 @@ import sheets
 
 MAX_WORKERS = 2
 SHEET_LOCK = threading.Lock()
-
-PAKISTAN_TZ = ZoneInfo("Asia/Karachi")
-TRANSIENT_HTTP_STATUSES = {403, 429, 500, 502, 503, 504}
-NAVIGATION_MAX_ATTEMPTS = 4
-NAVIGATION_BACKOFF_SECONDS = (3, 7, 15, 30)
-CREATIVE_CLASSIFY_TIMEOUT_SECONDS = 8
-IMAGE_TEXT_GRACE_SECONDS = 2.0
-AMBIGUOUS_VIDEO_DETECTION_SECONDS = 8
-VIDEO_PROBE_BEFORE_IMAGE_SECONDS = 5
-VIDEO_PROBE_BEFORE_TEXT_SECONDS = 5
-PLAYWRIGHT_ACTION_TIMEOUT_MS = 4000
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".m3u8")
 
@@ -101,22 +88,8 @@ def safe_add_log(row_number, status, log_type, url="", video_id="", app_link="",
         )
 
 
-def safe_mark_agent_retry(row_num, status):
-    """Keep transient failures unprocessed so a later pass can retry them."""
-    with SHEET_LOCK:
-        retry_fn = getattr(sheets, "mark_agent_retry", None)
-        if retry_fn:
-            retry_fn(row_num, status)
-        else:
-            try:
-                sheets.get_sheet().update_cell(row_num, 12, status)
-            except Exception:
-                pass
-
-
 def get_exact_time():
-    """Current Pakistan Standard Time (UTC+05:00)."""
-    return datetime.now(PAKISTAN_TZ).strftime("%I:%M:%S %p")
+    return datetime.now().strftime("%I:%M:%S %p")
 
 
 def clean_text(value):
@@ -161,676 +134,239 @@ def extract_package_name(app_link):
 # VIDEO ID LOGIC (REVERTED TO YOUR ORIGINAL WORKING LOGIC)
 # =========================
 
-
 def is_real_video_response(response):
-    """True only for an actual media response, never for thumbnails/player JSON."""
     try:
-        url = str(response.url or "").lower()
-        content_type = str(response.headers.get("content-type", "") or "").lower()
+        url = response.url.lower()
+        headers = response.headers
+        content_type = headers.get("content-type", "").lower()
 
         if content_type.startswith("video/"):
             return True
+
         if "application/vnd.apple.mpegurl" in content_type:
             return True
+
         if "application/x-mpegurl" in content_type:
             return True
-        if "videoplayback" in url or "googlevideo.com" in url:
+
+        if "videoplayback" in url:
             return True
+
         if any(ext in url for ext in VIDEO_EXTENSIONS):
             return True
+
     except Exception:
         pass
+
     return False
-
-
-def extract_videoplayback_id(req_url):
-    """
-    Return ONLY the value of the `id` query parameter from an actual
-    YouTube/Google `videoplayback` media request.
-
-    Example:
-        .../videoplayback?...&id=c4aa113822163fa0&itag=18...
-        -> c4aa113822163fa0
-
-    No YouTube watch/embed ID, thumbnail ID, itag, ei or source value is
-    accepted here.
-    """
-    try:
-        raw_url = str(req_url or "").strip()
-        if not raw_url:
-            return None
-
-        parsed = urlparse(raw_url)
-        lower = raw_url.lower()
-        host = str(parsed.netloc or "").lower()
-        path = str(parsed.path or "").lower()
-
-        # Require an actual media-playback request. googlevideo hosts normally
-        # use /videoplayback, but keep the host check as a fallback.
-        if "videoplayback" not in lower and "googlevideo.com" not in host:
-            return None
-
-        # Normal query parsing first.
-        query = parse_qs(parsed.query, keep_blank_values=True)
-        values = query.get("id") or query.get("ID")
-        if values:
-            value = unquote(str(values[0] or "")).strip()
-            if value:
-                return value
-
-        # Defensive fallback for unusual/partially escaped query strings.
-        match = re.search(r"(?:[?&]|\\u0026|%26)id(?:=|%3[dD]|\\u003[dD])([^&\\]+)", raw_url, re.I)
-        if match:
-            value = unquote(match.group(1)).strip()
-            if value:
-                return value
-    except Exception:
-        pass
-    return None
 
 
 def extract_video_id_from_url(req_url):
     """
-    Final video-ID extractor.
-
-    For YouTube/Google video ads, ONLY the `id=` value from the actual
-    `videoplayback` request is returned. Other YouTube IDs are intentionally
-    not returned because Column F must contain the playback-request ID.
-
-    Direct non-YouTube video files keep the previous filename fallback.
+    Extracts only clean video IDs or filenames.
+    Does NOT return full video links.
     """
     try:
-        raw_url = str(req_url or "")
-        url_lower = raw_url.lower()
-        parsed = urlparse(raw_url)
+        url_lower = req_url.lower()
+        parsed = urlparse(req_url)
+        query = parse_qs(parsed.query)
 
-        playback_id = extract_videoplayback_id(raw_url)
-        if playback_id:
-            return playback_id
+        if "videoplayback" in url_lower:
+            video_id = query.get("id", [None])[0]
 
-        # Preserve direct-file behavior for non-YouTube hosted video files.
-        if "youtube.com" not in url_lower and "youtu.be" not in url_lower and "googlevideo.com" not in url_lower:
-            for ext in VIDEO_EXTENSIONS:
-                if ext in url_lower:
-                    filename = parsed.path.split("/")[-1].split("?")[0].strip()
-                    if filename:
-                        return filename
+            if video_id:
+                return video_id
+
+            for key in ["itag", "ei", "source"]:
+                value = query.get(key, [None])[0]
+                if value:
+                    return value
+
+            return None
+
+        for ext in VIDEO_EXTENSIONS:
+            if ext in url_lower:
+                filename = parsed.path.split("/")[-1]
+                filename = filename.split("?")[0].strip()
+
+                if filename:
+                    return filename
+
+        if "youtube.com/embed/" in url_lower:
+            return req_url.split("youtube.com/embed/")[1].split("?")[0].split("&")[0]
+
+        if "youtube.com/watch" in url_lower:
+            return query.get("v", [None])[0]
+
+        if "youtu.be/" in url_lower:
+            return req_url.split("youtu.be/")[1].split("?")[0].split("&")[0]
+
     except Exception:
         return None
 
     return None
 
-def extract_video_id_from_json_payload(payload):
-    """Read only the top-level videoId from a YouTube PLAYER REQUEST."""
-    try:
-        if isinstance(payload, dict):
-            for key in ("videoId", "video_id"):
-                value = payload.get(key)
-                if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
-                    return value
-    except Exception:
-        pass
-    return None
-
-
-def _frame_visible_for_video(frame, page, min_width=80, min_height=45):
-    """Check that a frame is actually rendered as part of the current creative."""
-    try:
-        if frame == page.main_frame:
-            return False
-        element = frame.frame_element()
-        box = element.bounding_box(timeout=1200)
-        if not box:
-            return False
-        return (box.get("width", 0) or 0) >= min_width and (box.get("height", 0) or 0) >= min_height
-    except Exception:
-        return False
-
-
-def _frame_has_video_player(frame):
-    """Require a real player/video surface before trusting IDs inside a frame."""
-    js = r"""
-    () => {
-        const visible = (el) => {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width >= 80 && r.height >= 45 &&
-                   s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
-        };
-
-        const player = document.querySelector('#movie_player, .html5-video-player, [class*="video-player"], [class*="videoplayer"]');
-        if (player && visible(player)) return true;
-
-        if (Array.from(document.querySelectorAll('video')).some(visible)) return true;
-
-        return Array.from(document.querySelectorAll('button, [role="button"], [aria-label], [title]')).some(el => {
-            if (!visible(el)) return false;
-            const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
-            const title = String(el.getAttribute('title') || '').toLowerCase();
-            const cls = String(el.className || '').toLowerCase();
-            return aria.includes('play') || title.includes('play') || cls.includes('play-button') || cls.includes('playbutton');
-        });
-    }
-    """
-    try:
-        return bool(frame.evaluate(js))
-    except Exception:
-        return False
-
-
-def extract_active_youtube_player_id(page):
-    """
-    Get the YouTube ID from the ACTIVE visible player only.
-
-    This is the authoritative YouTube-ID path. It avoids unrelated thumbnails,
-    hidden templates and recursive player-response metadata.
-    """
-    js = r"""
-    () => {
-        const valid = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{11}$/.test(v);
-
-        try {
-            const player = document.querySelector('#movie_player');
-            if (player && typeof player.getVideoData === 'function') {
-                const data = player.getVideoData();
-                if (data && valid(data.video_id)) return data.video_id;
-            }
-        } catch (e) {}
-
-        try {
-            const r = window.ytInitialPlayerResponse;
-            if (r && r.videoDetails && valid(r.videoDetails.videoId)) return r.videoDetails.videoId;
-        } catch (e) {}
-
-        try {
-            const args = window.ytplayer && window.ytplayer.config && window.ytplayer.config.args;
-            if (args && valid(args.video_id)) return args.video_id;
-        } catch (e) {}
-
-        // Poster/thumbnail is accepted ONLY inside this already-verified visible player frame.
-        for (const el of document.querySelectorAll('video[poster], img[src]')) {
-            const value = String(el.poster || el.src || el.getAttribute('poster') || el.getAttribute('src') || '');
-            const m = value.match(/(?:i\.ytimg\.com|img\.youtube\.com)\/(?:vi|vi_webp)\/([A-Za-z0-9_-]{11})/i);
-            if (m) return m[1];
-        }
-
-        return null;
-    }
-    """
-
-    # Prefer explicit YouTube player frames, then any visible frame with a real video surface.
-    candidates = []
-    for frame in page.frames:
-        if not _frame_visible_for_video(frame, page):
-            continue
-        url = str(frame.url or '').lower()
-        priority = 0 if ('youtube.com' in url or 'youtube-nocookie.com' in url) else 1
-        candidates.append((priority, frame))
-
-    candidates.sort(key=lambda x: x[0])
-
-    for _, frame in candidates:
-        try:
-            explicit = extract_video_id_from_url(frame.url)
-            if explicit:
-                return explicit
-        except Exception:
-            pass
-
-        if not _frame_has_video_player(frame):
-            continue
-
-        try:
-            value = frame.evaluate(js)
-            if value and re.fullmatch(r"[A-Za-z0-9_-]{11}", str(value)):
-                return str(value)
-        except Exception:
-            continue
-
-    return "N/A"
-
-
-def extract_validated_player_request_id(page, captured):
-    """Use a player-request videoId only if its originating frame is still a visible video player."""
-    candidates = captured.get("_youtube_player_requests", []) or []
-    for video_id, frame in reversed(candidates):
-        try:
-            if frame not in page.frames:
-                continue
-            if not _frame_visible_for_video(frame, page):
-                continue
-            if not _frame_has_video_player(frame):
-                continue
-            if re.fullmatch(r"[A-Za-z0-9_-]{11}", str(video_id)):
-                return str(video_id)
-        except Exception:
-            continue
-    return "N/A"
-
-
-def scan_embedded_video_metadata(page):
-    """Only inspect the active visible player; never scan arbitrary page HTML."""
-    return extract_active_youtube_player_id(page)
-
 
 def extract_video_from_dom(page):
-    """Read ONLY actual media URLs from visible video/source DOM nodes."""
+    """
+    Checks actual video elements on page and inside frames.
+    """
+    try:
+        video_sources = page.evaluate("""
+            () => Array.from(document.querySelectorAll('video'))
+                .map(v => v.currentSrc || v.src || '')
+                .filter(Boolean)
+        """)
+
+        for src in video_sources:
+            video_id = extract_video_id_from_url(src)
+            if video_id:
+                return video_id
+
+    except Exception:
+        pass
+
     for frame in page.frames:
-        if frame != page.main_frame and not _frame_visible_for_video(frame, page):
-            continue
         try:
-            urls = frame.evaluate(r"""
-                () => {
-                    const visible = (el) => {
-                        if (!el) return false;
-                        const r = el.getBoundingClientRect();
-                        const s = window.getComputedStyle(el);
-                        return r.width > 0 && r.height > 0 &&
-                               s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
-                    };
-                    return Array.from(document.querySelectorAll('video, source'))
-                        .filter(el => el.tagName.toLowerCase() === 'source' || visible(el))
-                        .flatMap(el => [el.currentSrc || '', el.src || '', el.getAttribute('src') || ''])
-                        .filter(Boolean);
-                }
+            video_sources = frame.evaluate("""
+                () => Array.from(document.querySelectorAll('video'))
+                    .map(v => v.currentSrc || v.src || '')
+                    .filter(Boolean)
             """)
-            for src in urls:
-                found = extract_video_id_from_url(str(src))
-                if found:
-                    return found
+
+            for src in video_sources:
+                video_id = extract_video_id_from_url(src)
+                if video_id:
+                    return video_id
+
         except Exception:
             continue
 
     return "N/A"
+
 
 def scan_browser_performance_for_video(page):
     """
-    Scan resource timing entries for the actual `videoplayback` request and
-    return ONLY its `id=` value. This is a fallback for a request that fired
-    before/around Playwright event delivery.
+    Scans performance entries for real video URLs only.
     """
-    for frame in page.frames:
-        try:
-            urls = frame.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
-            for u in reversed(urls or []):
-                playback_id = extract_videoplayback_id(str(u))
-                if playback_id:
-                    return playback_id
+    try:
+        urls = page.evaluate("""
+            () => performance.getEntriesByType('resource').map(r => r.name)
+        """)
 
-                # Keep direct non-YouTube file fallback only.
-                direct_id = extract_video_id_from_url(str(u))
-                if direct_id:
-                    return direct_id
-        except Exception:
-            continue
+        for u in urls:
+            u_lower = u.lower()
+
+            if (
+                "videoplayback" in u_lower
+                or ".mp4" in u_lower
+                or ".webm" in u_lower
+                or ".mov" in u_lower
+                or ".m4v" in u_lower
+                or ".m3u8" in u_lower
+                or "youtube.com/embed/" in u_lower
+                or "youtube.com/watch" in u_lower
+                or "youtu.be/" in u_lower
+            ):
+                video_id = extract_video_id_from_url(u)
+
+                if video_id:
+                    return video_id
+
+    except Exception:
+        pass
 
     return "N/A"
+
 
 def click_possible_video_targets(page):
     """
-    Click a real play/video control first, including controls inside ad frames.
-    If the creative hides the control, click the largest visible creative iframe
-    once as a bounded fallback. This prevents video ads being saved as image.
+    Clicks possible video preview areas.
+    Avoids install buttons/app links.
     """
     selectors = [
         "video",
-        'button[aria-label*="Play" i]',
-        'button[title*="Play" i]',
-        'div[aria-label*="Play" i]',
-        '[role="button"][aria-label*="Play" i]',
-        '[class*="play-button" i]',
-        '[class*="playbutton" i]',
-        'img[src*="play" i]',
+        "iframe",
+        "creative-preview",
+        'button[aria-label*="Play"]',
+        'button[title*="Play"]',
+        'div[aria-label*="Play"]',
+        'img[src*="play"]'
     ]
 
-    targets = [page] + [frame for frame in page.frames if frame != page.main_frame]
-
-    for target in targets:
-        for sel in selectors:
-            try:
-                elements = target.locator(sel)
-                count = min(elements.count(), 10)
-
-                for i in range(count):
-                    el = elements.nth(i)
-                    if not el.is_visible():
-                        continue
-
-                    try:
-                        el.scroll_into_view_if_needed(timeout=1500)
-                        box = el.bounding_box(timeout=1500)
-                        if not box:
-                            continue
-
-                        # Play buttons can be small. Actual video surfaces must be larger.
-                        if sel == "video":
-                            if box["width"] < 120 or box["height"] < 80:
-                                continue
-                        elif box["width"] < 20 or box["height"] < 20:
-                            continue
-
-                        el.click(timeout=2000, force=True)
-                        page.wait_for_timeout(1000)
-                        return True
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-
-    # Fallback for creatives where the play control is hidden inside a cross-origin iframe.
-    iframe_candidates = []
-    try:
-        iframes = page.locator("iframe")
-        for i in range(min(iframes.count(), 20)):
-            try:
-                iframe = iframes.nth(i)
-                if not iframe.is_visible():
-                    continue
-                box = iframe.bounding_box(timeout=1200)
-                if not box:
-                    continue
-                width = box.get("width", 0) or 0
-                height = box.get("height", 0) or 0
-                y = box.get("y", 99999) or 99999
-                if width < 160 or height < 100 or y < -100 or y > 1000:
-                    continue
-                iframe_candidates.append((width * height, iframe, box))
-            except Exception:
-                continue
-    except Exception:
-        iframe_candidates = []
-
-    if iframe_candidates:
-        iframe_candidates.sort(key=lambda item: item[0], reverse=True)
-        _, iframe, box = iframe_candidates[0]
+    for sel in selectors:
         try:
-            page.mouse.click(
-                box["x"] + box["width"] / 2,
-                box["y"] + box["height"] / 2,
-            )
-            page.wait_for_timeout(1000)
-            return True
+            elements = page.locator(sel)
+            count = elements.count()
+
+            for i in range(count):
+                el = elements.nth(i)
+
+                if not el.is_visible():
+                    continue
+
+                try:
+                    el.scroll_into_view_if_needed(timeout=2000)
+                    box = el.bounding_box()
+
+                    if not box:
+                        continue
+
+                    if box["width"] < 120 or box["height"] < 80:
+                        continue
+
+                    x = box["x"] + box["width"] / 2
+                    y = box["y"] + box["height"] / 2
+
+                    page.mouse.click(x, y)
+                    page.wait_for_timeout(1500)
+                    return True
+
+                except Exception:
+                    continue
+
         except Exception:
-            pass
+            continue
 
     return False
 
+
 def wait_for_video_id(page, captured, max_seconds=20):
-    """Wait for the actual videoplayback `id=` value, not YouTube metadata."""
-    waited = 0.0
+    waited = 0
 
     while waited < max_seconds:
-        playback_id = captured.get("playback_id")
-        if playback_id and playback_id != "N/A":
-            captured["video_id"] = playback_id
-            return playback_id
-
-        # Compatibility: only trust captured video_id when it was populated by
-        # the media-request handler/direct non-YouTube file path.
-        captured_id = captured.get("video_id")
-        if captured_id and captured_id != "N/A" and not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(captured_id)):
-            return captured_id
+        if captured.get("video_id") and captured["video_id"] != "N/A":
+            return captured["video_id"]
 
         dom_video_id = extract_video_from_dom(page)
         if dom_video_id != "N/A":
-            captured["video_id"] = dom_video_id
             return dom_video_id
 
-        perf_video_id = scan_browser_performance_for_video(page)
-        if perf_video_id != "N/A":
-            captured["video_id"] = perf_video_id
-            captured["playback_id"] = perf_video_id
-            return perf_video_id
-
-        page.wait_for_timeout(250)
-        waited += 0.25
+        page.wait_for_timeout(500)
+        waited += 0.5
 
     return "N/A"
 
-def probe_video_before_image(page, captured, max_seconds=VIDEO_PROBE_BEFORE_IMAGE_SECONDS):
+
+def detect_video_id(page, captured):
     """
-    One bounded video probe before a static creative is labelled ``image``.
-    It preserves fast image handling but gives video ads enough time to start
-    and expose their real video ID.
+    Main video detection flow.
     """
-    video_id = get_immediate_video_id(page, captured)
-    if video_id != "N/A":
-        return video_id
-
-    click_possible_video_targets(page)
-    video_id = wait_for_video_id(page, captured, max_seconds=max_seconds)
-    if video_id != "N/A":
-        return video_id
-
-    return scan_browser_performance_for_video(page)
-
-
-def probe_video_before_text(page, captured, max_seconds=VIDEO_PROBE_BEFORE_TEXT_SECONDS):
-    """
-    Confirm that a creative with visible ad copy is not actually a video ad.
-    Video creatives commonly expose headline/description before playback starts.
-    """
-    started = time.time()
-
-    video_id = get_immediate_video_id(page, captured)
-    if video_id != "N/A":
-        return video_id
-
-    # When a play/video hint is visible, activate only the real play target.
-    if has_video_evidence(page, captured):
-        click_possible_video_targets(page)
-
-    remaining = max_seconds - (time.time() - started)
-    if remaining > 0:
-        video_id = wait_for_video_id(page, captured, max_seconds=remaining)
-        if video_id != "N/A":
-            return video_id
-
-    return get_immediate_video_id(page, captured)
-
-
-class TransientHTTPError(RuntimeError):
-    def __init__(self, status, url, message=None):
-        self.status = status
-        self.url = url
-        label = f"HTTP {status}" if status else "temporary network failure"
-        super().__init__(message or f"{label} while opening {url}")
-
-
-def _is_transient_navigation_error(exc):
-    text = str(exc).lower()
-    markers = (
-        "403", "429", "500", "502", "503", "504",
-        "err_connection_reset", "err_connection_closed",
-        "err_timed_out", "err_network_changed", "timeout"
-    )
-    return any(marker in text for marker in markers)
-
-
-def navigate_with_retry(page, url, row_num, max_attempts=NAVIGATION_MAX_ATTEMPTS):
-    """Retry temporary Google 403/503/429/5xx and browser network failures."""
-    last_error = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            status = response.status if response else None
-
-            if status in TRANSIENT_HTTP_STATUSES:
-                raise TransientHTTPError(status, url)
-
-            if status is not None and status >= 400:
-                raise RuntimeError(f"HTTP {status} while opening {url}")
-
-            # Smaller initial wait; later extraction functions poll only when needed.
-            page.wait_for_timeout(2500)
-            return response
-
-        except Exception as exc:
-            last_error = exc
-            transient = (
-                isinstance(exc, (TransientHTTPError, PlaywrightTimeoutError))
-                or _is_transient_navigation_error(exc)
-            )
-
-            if not transient:
-                raise
-
-            if attempt >= max_attempts:
-                status = getattr(exc, "status", None)
-                raise TransientHTTPError(status, url, str(exc)) from exc
-
-            wait_seconds = NAVIGATION_BACKOFF_SECONDS[min(attempt - 1, len(NAVIGATION_BACKOFF_SECONDS) - 1)]
-            print(
-                f"⚠️ Row {row_num}: temporary page error on attempt "
-                f"{attempt}/{max_attempts}: {exc}; retrying in {wait_seconds}s"
-            )
-
-            try:
-                page.goto("about:blank", wait_until="commit", timeout=10000)
-            except Exception:
-                pass
-
-            page.wait_for_timeout(wait_seconds * 1000)
-
-    raise TransientHTTPError(None, url, str(last_error))
-
-
-
-def get_immediate_video_id(page, captured):
-    """
-    Fast final-ID lookup.
-
-    YouTube: accepts ONLY the actual `videoplayback` request's `id=` value.
-    The visible YouTube player ID and youtubei player-request videoId are used
-    elsewhere only as evidence that the creative is a video.
-    """
-    playback_id = captured.get("playback_id")
-    if playback_id and playback_id != "N/A":
-        captured["video_id"] = playback_id
-        return playback_id
-
-    captured_id = captured.get("video_id", "N/A")
-    if captured_id and captured_id != "N/A":
-        # Reject 11-char YouTube metadata IDs as final Column-F values.
-        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(captured_id)):
-            return captured_id
-
     video_id = extract_video_from_dom(page)
-    if video_id != "N/A":
-        captured["video_id"] = video_id
-        if extract_videoplayback_id(str(video_id)):
-            captured["playback_id"] = video_id
-        return video_id
 
-    video_id = scan_browser_performance_for_video(page)
-    if video_id != "N/A":
-        captured["video_id"] = video_id
-        captured["playback_id"] = video_id
-        return video_id
-
-    return "N/A"
-
-def has_video_hint(page):
-    """Detect only visible player/video evidence. Hidden thumbnails do not count."""
-    # An actual active YouTube player is the strongest hint.
-    if extract_active_youtube_player_id(page) != "N/A":
-        return True
-
-    js = r"""
-    () => {
-        const visible = (el) => {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width > 20 && r.height > 20 &&
-                   s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
-        };
-
-        if (Array.from(document.querySelectorAll('video')).some(visible)) return true;
-
-        for (const el of document.querySelectorAll('iframe[src]')) {
-            if (!visible(el)) continue;
-            const value = String(el.src || el.getAttribute('src') || '').toLowerCase();
-            if (value.includes('youtube.com/embed/') || value.includes('youtube-nocookie.com/embed/')) return true;
-        }
-
-        for (const el of document.querySelectorAll('button, [role="button"], [aria-label], [title], source[type]')) {
-            const tag = String(el.tagName || '').toLowerCase();
-            const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
-            const title = String(el.getAttribute('title') || '').toLowerCase();
-            const cls = String(el.className || '').toLowerCase();
-            const type = String(el.getAttribute('type') || '').toLowerCase();
-            const txt = String(el.innerText || el.textContent || '').trim().toLowerCase();
-            if (type.startsWith('video/')) return true;
-            if (!visible(el) && tag !== 'source') continue;
-            if (aria.includes('play') || title.includes('play') ||
-                cls.includes('play-button') || cls.includes('playbutton') ||
-                cls.includes('video-player') || cls.includes('videoplayer') ||
-                txt === 'play') return true;
-        }
-        return false;
-    }
-    """
-
-    for target in [page] + [f for f in page.frames if f != page.main_frame]:
-        try:
-            if target.evaluate(js):
-                return True
-        except Exception:
-            continue
-    return False
-
-def has_video_evidence(page, captured):
-    """Visible player evidence OR a YouTube/player/media request seen for this row."""
-    if captured.get("_video_evidence"):
-        return True
-    return has_video_hint(page)
-
-
-def detect_video_id(page, captured, max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS):
-    """
-    Bounded video detection.
-
-    Static image/text ads no longer wait 25+ seconds. Full clicking/waiting is
-    used only when the creative exposes a real video/play hint.
-    """
-    started = time.time()
-
-    video_id = get_immediate_video_id(page, captured)
-    if video_id != "N/A":
-        return video_id
-
-    hint = has_video_evidence(page, captured)
-
-    # No video evidence: allow only a short network grace period.
-    if not hint:
-        remaining = max_total_seconds - (time.time() - started)
-        if remaining > 0:
-            return wait_for_video_id(page, captured, max_seconds=min(2, remaining))
-        return "N/A"
-
-    clicked = click_possible_video_targets(page)
-    remaining = max_total_seconds - (time.time() - started)
-    if remaining > 0:
-        video_id = wait_for_video_id(
-            page,
-            captured,
-            max_seconds=min(5 if clicked else 3, remaining)
-        )
+    if video_id == "N/A":
+        click_possible_video_targets(page)
+        video_id = wait_for_video_id(page, captured, max_seconds=15)
 
     if video_id == "N/A":
         video_id = scan_browser_performance_for_video(page)
 
-    remaining = max_total_seconds - (time.time() - started)
-    if video_id == "N/A" and remaining > 1:
-        page.mouse.wheel(0, 350)
-        page.wait_for_timeout(500)
-        clicked = click_possible_video_targets(page)
-        remaining = max_total_seconds - (time.time() - started)
-        if clicked and remaining > 0:
-            video_id = wait_for_video_id(page, captured, max_seconds=min(3, remaining))
+    if video_id == "N/A":
+        page.mouse.wheel(0, 400)
+        page.wait_for_timeout(1500)
+
+        click_possible_video_targets(page)
+        video_id = wait_for_video_id(page, captured, max_seconds=10)
 
     return video_id
 
@@ -1625,259 +1161,6 @@ def get_ranked_non_video_targets(page):
     return ranked
 
 
-def extract_text_ad_details_once(page):
-    """
-    Strict text-ad probe.
-
-    A row is considered a text ad only when the active creative contains the
-    same explicit text-ad structures used by the previous working scraper.
-    Generic ``headline``/``description`` class matches are intentionally not
-    used because static image creatives can contain those words in wrappers,
-    metadata, accessibility nodes, or stale template frames.
-
-    A dominant raster/canvas/background creative suppresses text detection, so
-    text printed inside an image banner does not turn that image ad into a text
-    ad.
-    """
-    js = r"""
-    () => {
-        const clean = (value) => String(value || '')
-            .replace(/\n/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim();
-
-        const visible = (el) => {
-            if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 &&
-                   style.display !== 'none' &&
-                   style.visibility !== 'hidden' &&
-                   style.opacity !== '0';
-        };
-
-        const bad = (text) => {
-            const t = clean(text).toLowerCase();
-            if (!t || t.length < 2 || t.includes('{{') || t.includes('}}')) {
-                return true;
-            }
-            return [
-                'ads transparency center', 'ads transparency centre',
-                'see more ads', 'report this ad', 'sign in', 'last shown',
-                'about this ad', 'why this ad', 'ad details'
-            ].some(x => t === x || t.startsWith(x));
-        };
-
-        const viewportWidth = Math.max(
-            document.documentElement ? document.documentElement.clientWidth : 0,
-            window.innerWidth || 0
-        );
-        const viewportHeight = Math.max(
-            document.documentElement ? document.documentElement.clientHeight : 0,
-            window.innerHeight || 0
-        );
-        const viewportArea = Math.max(viewportWidth * viewportHeight, 1);
-
-        // Static image ads normally contain one visual that occupies most of
-        // the creative frame. Small app icons/logos do not trigger this.
-        let dominantImage = false;
-
-        for (const el of document.querySelectorAll('img, picture, canvas')) {
-            if (!visible(el)) continue;
-            const rect = el.getBoundingClientRect();
-            const src = String(el.getAttribute('src') || '').toLowerCase();
-            const alt = String(el.getAttribute('alt') || '').toLowerCase();
-            if (src.includes('googlelogo') || alt.includes('google')) continue;
-
-            const coverage = (rect.width * rect.height) / viewportArea;
-            if (
-                rect.width >= 180 && rect.height >= 90 &&
-                (coverage >= 0.45 || (rect.width * rect.height) >= 90000)
-            ) {
-                dominantImage = true;
-                break;
-            }
-        }
-
-        if (!dominantImage) {
-            for (const el of document.querySelectorAll('div, a, section')) {
-                if (!visible(el)) continue;
-                const rect = el.getBoundingClientRect();
-                const bg = window.getComputedStyle(el).backgroundImage || '';
-                if (!bg || bg === 'none' || !bg.includes('url(')) continue;
-                if (bg.toLowerCase().includes('googlelogo')) continue;
-
-                const coverage = (rect.width * rect.height) / viewportArea;
-                if (
-                    rect.width >= 180 && rect.height >= 90 &&
-                    (coverage >= 0.45 || (rect.width * rect.height) >= 90000)
-                ) {
-                    dominantImage = true;
-                    break;
-                }
-            }
-        }
-
-        const firstText = (selectors, minLen, maxLen, excludedText = '') => {
-            for (const selector of selectors) {
-                for (const el of document.querySelectorAll(selector)) {
-                    if (!visible(el)) continue;
-                    const text = clean(el.innerText || el.textContent || '');
-                    if (text === excludedText) continue;
-                    if (text.length < minLen || text.length > maxLen || bad(text)) {
-                        continue;
-                    }
-                    return text;
-                }
-            }
-            return 'N/A';
-        };
-
-        const descriptionBelowHeadline = (headlineText) => {
-            if (!headlineText || headlineText === 'N/A') return 'N/A';
-
-            let headlineEl = null;
-            for (const selector of [
-                '[class*="-e-15"]',
-                'div[role="link"] > span',
-                'div[role="link"] span',
-                'div.cS4Vcb-vnv8ic'
-            ]) {
-                for (const el of document.querySelectorAll(selector)) {
-                    if (!visible(el)) continue;
-                    const text = clean(el.innerText || el.textContent || '');
-                    if (text === headlineText) {
-                        headlineEl = el;
-                        break;
-                    }
-                }
-                if (headlineEl) break;
-            }
-
-            if (!headlineEl) return 'N/A';
-            const headRect = headlineEl.getBoundingClientRect();
-            const headStyle = window.getComputedStyle(headlineEl);
-            const headFont = parseFloat(headStyle.fontSize || '0') || 0;
-            const candidates = [];
-
-            for (const el of document.querySelectorAll('div, span, p')) {
-                if (el === headlineEl || el.childElementCount > 0 || !visible(el)) continue;
-                const text = clean(el.innerText || el.textContent || '');
-                if (text === headlineText || text.length < 5 || text.length > 320 || bad(text)) continue;
-                const lower = text.toLowerCase();
-                if (lower === 'google play' || lower === 'install' || lower === 'download' || lower === 'get') continue;
-
-                const rect = el.getBoundingClientRect();
-                const verticalGap = rect.top - headRect.bottom;
-                const horizontalOverlap = Math.min(rect.right, headRect.right) - Math.max(rect.left, headRect.left);
-                if (verticalGap < -2 || verticalGap > 140 || horizontalOverlap < 10) continue;
-
-                const font = parseFloat(window.getComputedStyle(el).fontSize || '0') || 0;
-                // The description shown under the marked headline is normally
-                // smaller or equal in size and spatially closest below it.
-                if (headFont > 0 && font > headFont + 1) continue;
-                candidates.push({text, gap: Math.max(verticalGap, 0), font});
-            }
-
-            candidates.sort((a, b) => a.gap - b.gap || b.text.length - a.text.length);
-            return candidates.length ? candidates[0].text : 'N/A';
-        };
-
-        // Keep only the specific structures from the previous working logic.
-        // Do not use broad selectors such as [class*="headline"] or
-        // [class*="description"].
-        let headline = firstText([
-            '[class*="-e-15"]',
-            'div[role="link"] > span',
-            'div[role="link"] span',
-            'div.cS4Vcb-vnv8ic'
-        ], 3, 180);
-
-        let description = firstText([
-            '[class*="-e-67"]',
-            'div.HFTpmd-WsjYwc-hgDUwe',
-            'div.cS4Vcb-vnv8ic'
-        ], 5, 320, headline);
-
-        if (description === 'N/A') {
-            description = descriptionBelowHeadline(headline);
-        }
-        if (description === headline) description = 'N/A';
-
-        // A dominant image wins over text-like metadata/accessibility content.
-        if (dominantImage) {
-            return {
-                headline: 'N/A',
-                description: 'N/A',
-                score: 0,
-                dominantImage: true
-            };
-        }
-
-        let score = 0;
-        if (headline !== 'N/A') score += 120;
-        if (description !== 'N/A') score += 100;
-
-        return {headline, description, score, dominantImage: false};
-    }
-    """
-
-    candidates = []
-
-    # Inspect only visible, reasonably sized creative frames. Hidden/stale
-    # frames are a common source of false text classifications.
-    for frame in page.frames:
-        if frame == page.main_frame:
-            continue
-        try:
-            box = _frame_parent_box(frame)
-            if not box:
-                continue
-            width = box.get("width", 0) or 0
-            height = box.get("height", 0) or 0
-            y = box.get("y", 99999) or 99999
-            if width < 100 or height < 60 or y > 1400:
-                continue
-
-            result = frame.evaluate(js)
-            if result and result.get("score", 0) > 0:
-                area_bonus = min((width * height) / 10000, 50)
-                candidates.append((result.get("score", 0) + area_bonus, result))
-        except Exception:
-            continue
-
-    # Main page fallback is allowed only for strict text-ad structures and only
-    # when it is not dominated by an image. The Google shell is excluded.
-    if not candidates:
-        try:
-            body_text = page.evaluate(
-                "() => document.body ? document.body.innerText.toLowerCase() : ''"
-            )
-            shell_page = (
-                "ads transparency center" in body_text
-                or "ads transparency centre" in body_text
-            )
-            result = page.evaluate(js)
-            if (
-                not shell_page
-                and result
-                and result.get("score", 0) > 0
-                and not result.get("dominantImage", False)
-            ):
-                candidates.append((result.get("score", 0), result))
-        except Exception:
-            pass
-
-    if not candidates:
-        return {"headline": "N/A", "description": "N/A"}
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    best = candidates[0][1]
-    return {
-        "headline": clean_text(best.get("headline")),
-        "description": clean_text(best.get("description")),
-    }
-
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
     Extracts headline and description for non-video ads.
@@ -1947,8 +1230,6 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
-
-
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
 # =========================
@@ -1962,398 +1243,138 @@ def is_valid_text_ad(headline, description):
 
 def has_visible_image_creative(page):
     """
-    Detect a real static image creative, not Google shell SVGs or small app icons.
-
-    Only large raster/canvas/background artwork inside visible creative frames
-    counts. Text extraction always gets priority before this result is used.
+    Detects likely image/display creative for non-video ads.
+    Used only after video detection returns N/A.
     """
     js = r"""
     () => {
-        const visible = (el) => {
+        const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            return rect.width >= 200 && rect.height >= 100 &&
-                   (rect.width * rect.height) >= 40000 &&
-                   style.display !== 'none' &&
-                   style.visibility !== 'hidden' &&
-                   style.opacity !== '0';
+            return (
+                rect.width >= 120 &&
+                rect.height >= 80 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
         };
 
-        for (const el of document.querySelectorAll('img, picture, canvas')) {
-            if (!visible(el)) continue;
+        const imageLike = Array.from(document.querySelectorAll('img, picture, canvas, svg')).some(el => {
             const src = String(el.getAttribute('src') || '').toLowerCase();
             const alt = String(el.getAttribute('alt') || '').toLowerCase();
-            if (src.includes('googlelogo') || alt.includes('google')) continue;
-            return true;
-        }
+            if (src.includes('googlelogo') || alt.includes('google')) return false;
+            return isVisible(el);
+        });
 
-        for (const el of document.querySelectorAll('div, a, section')) {
-            if (!visible(el)) continue;
+        if (imageLike) return true;
+
+        return Array.from(document.querySelectorAll('*')).some(el => {
+            if (!isVisible(el)) return false;
             const bg = window.getComputedStyle(el).backgroundImage || '';
-            if (bg && bg !== 'none' && bg.includes('url(') && !bg.toLowerCase().includes('googlelogo')) {
-                return true;
-            }
-        }
-
-        return false;
+            return bg && bg !== 'none' && bg.includes('url(');
+        });
     }
     """
 
+    try:
+        if page.evaluate(js):
+            return True
+    except Exception:
+        pass
+
     for frame in page.frames:
-        if frame == page.main_frame:
-            continue
         try:
-            box = _frame_parent_box(frame)
-            if not box:
-                continue
-            if (box.get("width", 0) or 0) < 120 or (box.get("height", 0) or 0) < 70:
-                continue
             if frame.evaluate(js):
                 return True
         except Exception:
             continue
 
     return False
-
-
-
-def has_any_visible_image_creative(page):
-    """Final fallback for image creatives that use smaller images/SVG/CSS artwork."""
-    js = r"""
-    () => {
-        const visible = (el) => {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width >= 120 && r.height >= 80 &&
-                   r.bottom > 0 && r.right > 0 &&
-                   s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
-        };
-
-        for (const el of document.querySelectorAll('img, picture, canvas, svg')) {
-            if (!visible(el)) continue;
-            const src = String(el.getAttribute('src') || '').toLowerCase();
-            const alt = String(el.getAttribute('alt') || '').toLowerCase();
-            if (src.includes('googlelogo') || alt.includes('google')) continue;
-            return true;
-        }
-
-        for (const el of document.querySelectorAll('div, a, section')) {
-            if (!visible(el)) continue;
-            const bg = String(window.getComputedStyle(el).backgroundImage || '');
-            if (bg && bg !== 'none' && bg.includes('url(') && !bg.toLowerCase().includes('googlelogo')) return true;
-        }
-        return false;
-    }
-    """
-
-    # Creative frames only; do not classify Google Transparency shell artwork as an ad.
-    for frame in page.frames:
-        if frame == page.main_frame:
-            continue
-        try:
-            box = _frame_parent_box(frame)
-            if not box:
-                continue
-            if (box.get('width', 0) or 0) < 100 or (box.get('height', 0) or 0) < 60:
-                continue
-            if frame.evaluate(js):
-                return True
-        except Exception:
-            continue
-    return False
-
-def classify_creative(page, captured, max_wait_seconds=CREATIVE_CLASSIFY_TIMEOUT_SECONDS):
-    """Return (kind, video_id, headline, description) with video checked before text."""
-    deadline = time.time() + max_wait_seconds
-    first_image_seen_at = None
-    video_probe_done = False
-    text_video_probe_done = False
-    last_headline = "N/A"
-    last_description = "N/A"
-
-    while time.time() < deadline:
-        video_id = get_immediate_video_id(page, captured)
-        if video_id != "N/A":
-            return "video", video_id, "N/A", "N/A"
-
-        text_data = extract_text_ad_details_once(page)
-        headline = clean_text(text_data.get("headline"))
-        description = clean_text(text_data.get("description"))
-        has_text = is_valid_text_ad(headline, description)
-        last_headline, last_description = headline, description
-
-        # Headline/description can belong to a VIDEO ad. Never write "text"
-        # until a bounded video-ID probe has completed.
-        if has_text:
-            if not text_video_probe_done:
-                text_video_probe_done = True
-                video_id = probe_video_before_text(page, captured)
-                if video_id != "N/A":
-                    return "video", video_id, "N/A", "N/A"
-
-            # If a real visible player/play surface is still present, do NOT
-            # downgrade the creative to text just because its ad copy loaded first.
-            if has_video_evidence(page, captured):
-                page.wait_for_timeout(500)
-                continue
-
-            return "text", "N/A", headline, description
-
-        image_like = has_visible_image_creative(page)
-        if image_like:
-            if first_image_seen_at is None:
-                first_image_seen_at = time.time()
-            elif time.time() - first_image_seen_at >= IMAGE_TEXT_GRACE_SECONDS:
-                if not video_probe_done:
-                    video_probe_done = True
-                    video_id = probe_video_before_image(page, captured)
-                    if video_id != "N/A":
-                        return "video", video_id, "N/A", "N/A"
-
-                    text_data = extract_text_ad_details_once(page)
-                    headline = clean_text(text_data.get("headline"))
-                    description = clean_text(text_data.get("description"))
-                    if is_valid_text_ad(headline, description):
-                        if not text_video_probe_done:
-                            text_video_probe_done = True
-                            video_id = probe_video_before_text(page, captured)
-                            if video_id != "N/A":
-                                return "video", video_id, "N/A", "N/A"
-                        return "text", "N/A", headline, description
-
-                # Same protection for video creatives that visually look like
-                # a poster/image before playback exposes the ID.
-                if has_video_evidence(page, captured):
-                    page.wait_for_timeout(500)
-                    continue
-
-                return "image", "N/A", "N/A", "N/A"
-        else:
-            first_image_seen_at = None
-
-        page.wait_for_timeout(500)
-
-    video_id = detect_video_id(page, captured, max_total_seconds=AMBIGUOUS_VIDEO_DETECTION_SECONDS)
-    if video_id != "N/A":
-        return "video", video_id, "N/A", "N/A"
-
-    text_data = extract_text_ad_details_once(page)
-    headline = clean_text(text_data.get("headline"))
-    description = clean_text(text_data.get("description"))
-    if is_valid_text_ad(headline, description):
-        if not text_video_probe_done:
-            video_id = probe_video_before_text(page, captured)
-            if video_id != "N/A":
-                return "video", video_id, "N/A", "N/A"
-        if not has_video_evidence(page, captured):
-            return "text", "N/A", headline, description
-
-    if has_visible_image_creative(page):
-        if not video_probe_done:
-            video_id = probe_video_before_image(page, captured)
-            if video_id != "N/A":
-                return "video", video_id, "N/A", "N/A"
-        if not has_video_evidence(page, captured):
-            return "image", "N/A", "N/A", "N/A"
-
-    # Last-resort image fallback: only after video and text have both failed.
-    # This restores image ads that use SVG/smaller/CSS artwork instead of a large raster.
-    if has_any_visible_image_creative(page) and not has_video_evidence(page, captured):
-        return "image", "N/A", "N/A", "N/A"
-
-    # A YouTube player/request was seen but the media request may have started late.
-    # Give ONLY these likely-video rows one final bounded chance to expose
-    # videoplayback?...&id=...; static text/image rows do not pay this cost.
-    if has_video_evidence(page, captured):
-        click_possible_video_targets(page)
-        video_id = wait_for_video_id(page, captured, max_seconds=8)
-        if video_id != "N/A":
-            return "video", video_id, "N/A", "N/A"
-
-    return "unknown", "N/A", last_headline, last_description
-
-def save_fast_image_ad(page, row_num, url, advertiser):
-    """
-    Save an image row without processing its app link, package, or ad text.
-
-    This is intentionally minimal: column F receives only ``image`` and the
-    worker immediately moves to the next row.
-    """
-    process_time = get_exact_time()
-    data = [
-        advertiser,
-        "N/A",
-        url,
-        "N/A",
-        process_time,
-        "image",
-        process_time,
-    ]
-
-    safe_update_combined_row(row_num, data)
-    safe_update_headline_desc(row_num, "N/A", "N/A")
-    safe_add_log(
-        row_number=row_num,
-        status="SUCCESS",
-        log_type="FAST_IMAGE_AD",
-        url=url,
-        video_id="image",
-        app_link="N/A",
-        message="Static image ad classified and saved without further processing",
-    )
-    print(f"✅ Row {row_num}: saved IMAGE ad without extra processing")
 
 
 def scrape_single_url(url_row):
     row_num, url = url_row
 
     with sync_playwright() as p:
-        browser = None
-        context = None
-        page = None
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-web-security",
+            ]
+        )
+
+        context = browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            service_workers="block",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+
+        page = context.new_page()
+        captured = {"video_id": "N/A"}
+
+        # ORIGINAL VIDEO RESPONSE HANDLER - kept unchanged.
+        def handle_response(response):
+            try:
+                if not is_real_video_response(response):
+                    return
+
+                video_id = extract_video_id_from_url(response.url)
+
+                if video_id and captured["video_id"] == "N/A":
+                    captured["video_id"] = video_id
+
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
 
         try:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-web-security",
-                ],
-            )
-
-            context = browser.new_context(
-                viewport={"width": 1366, "height": 768},
-                service_workers="block",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-            )
-            context.set_default_timeout(PLAYWRIGHT_ACTION_TIMEOUT_MS)
-            context.set_default_navigation_timeout(60000)
-
-            # Fonts are unnecessary for extraction and can materially delay ads.
-            try:
-                context.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type == "font"
-                    else route.continue_(),
-                )
-            except Exception:
-                pass
-
-            page = context.new_page()
-            page.set_default_timeout(PLAYWRIGHT_ACTION_TIMEOUT_MS)
-            page.set_default_navigation_timeout(60000)
-            captured = {"video_id": "N/A", "playback_id": "N/A", "_youtube_player_requests": [], "_video_evidence": False}
-
-            def handle_request(request):
-                try:
-                    request_url = str(request.url or "")
-                    lower = request_url.lower()
-
-                    # This is the exact ID requested by the user: the value of
-                    # `id=` on the actual videoplayback media request.
-                    playback_id = extract_videoplayback_id(request_url)
-                    if playback_id:
-                        captured["playback_id"] = playback_id
-                        captured["video_id"] = playback_id
-                        captured["_video_evidence"] = True
-                        return
-
-                    # These URLs prove that this creative is likely a video, but
-                    # their IDs are NEVER written to Column F.
-                    if (
-                        "youtubei/v1/player" in lower
-                        or "youtube.com/embed/" in lower
-                        or "youtube-nocookie.com/embed/" in lower
-                        or "googlevideo.com" in lower
-                    ):
-                        captured["_video_evidence"] = True
-
-                    # Preserve non-YouTube direct-video filename behavior.
-                    if "youtube" not in lower and "googlevideo.com" not in lower:
-                        direct_id = extract_video_id_from_url(request_url)
-                        if direct_id:
-                            captured["video_id"] = direct_id
-                except Exception:
-                    pass
-
-            def handle_response(response):
-                try:
-                    response_url = str(response.url or "")
-                    playback_id = extract_videoplayback_id(response_url)
-                    if playback_id:
-                        # Always overwrite earlier metadata/direct candidates.
-                        # The media request is authoritative for Column F.
-                        captured["playback_id"] = playback_id
-                        captured["video_id"] = playback_id
-                        captured["_video_evidence"] = True
-                        return
-
-                    if is_real_video_response(response):
-                        captured["_video_evidence"] = True
-                        direct_id = extract_video_id_from_url(response_url)
-                        if direct_id and "youtube" not in response_url.lower() and "googlevideo.com" not in response_url.lower():
-                            captured["video_id"] = direct_id
-                except Exception:
-                    pass
-
-            # Page events cover the current transparency page and all of its frames.
-            page.on("request", handle_request)
-            page.on("response", handle_response)
-
-            # Context events also catch requests from popup/OOPIF player surfaces.
-            # Duplicate callbacks are harmless because the authoritative ID is
-            # simply assigned to the same captured value.
-            try:
-                context.on("request", handle_request)
-                context.on("response", handle_response)
-            except Exception:
-                pass
-
             if "region=" not in url:
                 separator = "&" if "?" in url else "?"
                 url = f"{url}{separator}region=anywhere"
 
             print(f"🔍 Row {row_num}: opening transparency URL")
+
             safe_add_log(
                 row_number=row_num,
                 status="STARTED",
                 log_type="COMBINED",
                 url=url,
-                message="Started combined video/text/image ad extraction",
+                message="Started combined video/text/image ad extraction"
             )
 
-            navigate_with_retry(page, url, row_num)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4000)
+
             advertiser = extract_advertiser_from_page(page)
 
-            kind, video_id, headline, description = classify_creative(page, captured)
+            # VIDEO LOGIC: same original flow. No text/image extraction runs before this.
+            video_id = detect_video_id(page, captured)
+            video_time = get_exact_time()
 
             # =========================
-            # IMAGE AD: no extra processing
+            # VIDEO AD PATH
             # =========================
-            if kind == "image":
-                save_fast_image_ad(page, row_num, url, advertiser)
-                return
+            if video_id != "N/A":
+                print(f"🎬 Row {row_num}: video ID found first: {video_id}")
 
-            # =========================
-            # VIDEO AD: column F = real video ID
-            # =========================
-            if kind == "video" and video_id != "N/A":
-                print(f"🎬 Row {row_num}: video ID found: {video_id}")
-                app_link = wait_and_extract_install_link(page, max_wait_seconds=25)
+                app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
                 app_link_time = get_exact_time()
-                video_headline, video_description = wait_and_extract_headline_description(
-                    page,
-                    max_wait_seconds=10,
-                )
+
+                headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
 
                 if app_link == "N/A":
                     status = "VIDEO_FOUND_APP_LINK_NOT_FOUND"
@@ -2363,21 +1384,20 @@ def scrape_single_url(url_row):
                     message = "Video ID and app link saved"
 
                 package_name = extract_package_name(app_link)
+
                 data = [
                     advertiser,
                     package_name,
                     url,
                     app_link,
                     app_link_time,
-                    video_id,
-                    get_exact_time(),
+                    video_id,      # Column F: actual video ID for video ads
+                    video_time
                 ]
+
                 safe_update_combined_row(row_num, data)
-                safe_update_headline_desc(
-                    row_num,
-                    clean_text(video_headline),
-                    clean_text(video_description),
-                )
+                safe_update_headline_desc(row_num, headline, description)
+
                 safe_add_log(
                     row_number=row_num,
                     status=status,
@@ -2385,194 +1405,167 @@ def scrape_single_url(url_row):
                     url=url,
                     video_id=video_id,
                     app_link=app_link,
-                    message=message,
+                    message=message
                 )
-                print(f"✅ Row {row_num}: saved VIDEO ad")
+
+                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + video ID + text")
                 return
 
             # =========================
-            # TEXT AD: reference logic from user's uploaded working scraper
-            # Column F = text
+            # NON-VIDEO PATH: TEXT + IMAGE ADS
             # =========================
-            if kind == "text":
-                # Re-read headline/description using the exact reference text-ad flow.
-                text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
-                ref_headline = clean_text(text_data.get("headline"))
-                ref_description = clean_text(text_data.get("description"))
+            print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
-                if is_valid_text_ad(ref_headline, ref_description):
-                    headline = ref_headline
-                    description = ref_description
-
-                if is_valid_text_ad(headline, description):
-                    print(f"📄 Row {row_num}: text ad found -> {headline}")
-                    process_time = get_exact_time()
-
-                    # Reference flow: visible install link first.
-                    visible_app_link = wait_and_extract_install_link(
-                        page,
-                        max_wait_seconds=8,
-                    )
-                    visible_package = extract_package_name(visible_app_link)
-
-                    if visible_package != "N/A":
-                        package_name = visible_package
-                        app_link = visible_app_link
-                        match_score = 1.0
-                        status = "SUCCESS"
-                        message = "Non-video text ad package extracted from visible install link"
-                        print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
-                    else:
-                        # Reference fallback: scan rendered DOM/links, then strictly
-                        # match package against visible headline + description.
-                        print(
-                            f"📦 Row {row_num}: visible install link not found, "
-                            "strict matching with headline + description"
-                        )
-                        all_found_packages = extract_package_from_page(page)
-                        package_name, match_score = get_best_matching_package(
-                            headline,
-                            description,
-                            all_found_packages,
-                        )
-
-                        if package_name:
-                            app_link = f"https://play.google.com/store/apps/details?id={package_name}"
-                            status = "SUCCESS"
-                            message = (
-                                "Non-video text ad package strictly matched "
-                                f"with score {match_score}"
-                            )
-                            print(
-                                f"✅ Row {row_num}: strict matched package -> "
-                                f"{package_name} | score={match_score}"
-                            )
-                        else:
-                            package_name = "N/A"
-                            app_link = "N/A"
-                            status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                            message = (
-                                "Non-video text ad found, but package score below 0.76. "
-                                f"Best score={match_score}"
-                            )
-                            print(
-                                f"⚠️ Row {row_num}: package score below 0.76, "
-                                f"writing N/A | best score={match_score}"
-                            )
-
-                    data = [
-                        advertiser,
-                        package_name,
-                        url,
-                        app_link,
-                        process_time,
-                        "text",
-                        process_time,
-                    ]
-                    safe_update_combined_row(row_num, data)
-                    safe_update_headline_desc(row_num, headline, description)
-                    safe_add_log(
-                        row_number=row_num,
-                        status=status,
-                        log_type="TEXT_AD",
-                        url=url,
-                        video_id="text",
-                        app_link=app_link,
-                        message=message,
-                    )
-                    print(f"✅ Row {row_num}: saved TEXT ad")
-                    return
-
-            # No supported creative could be verified. Keep the old N/A behavior.
+            text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+            headline = clean_text(text_data.get("headline"))
+            description = clean_text(text_data.get("description"))
             process_time = get_exact_time()
+            has_text = is_valid_text_ad(headline, description)
+
+            # First try visible install/app link from the active creative.
+            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
+            visible_package = extract_package_name(visible_app_link)
+
+            is_image_like = has_visible_image_creative(page)
+            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
+
+            if not has_text and visible_package == "N/A" and not is_image_like:
+                data = [
+                    advertiser,
+                    "N/A",
+                    url,
+                    "N/A",
+                    process_time,
+                    "N/A",
+                    process_time
+                ]
+
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, "N/A", "N/A")
+
+                safe_add_log(
+                    row_number=row_num,
+                    status="NO_VIDEO_NO_TEXT_IMAGE",
+                    log_type="COMBINED",
+                    url=url,
+                    video_id="N/A",
+                    app_link="N/A",
+                    message="No video ID and no valid text/image creative found"
+                )
+
+                print(f"⏭ Row {row_num}: no video and no valid text/image ad found")
+                return
+
+            if has_text:
+                print(f"🔎 Row {row_num}: text/image headline -> {headline}")
+            else:
+                print(f"🖼 Row {row_num}: likely image ad, headline/description not found")
+
+            print(f"📦 Row {row_num}: resolving package from visible install link first")
+
+            if visible_package != "N/A":
+                package_name = visible_package
+                app_link = visible_app_link
+                match_score = 1.0
+                status = "SUCCESS"
+                message = f"Non-video {ad_type} ad package extracted from visible install link"
+                print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
+            else:
+                package_name = None
+                match_score = 0.0
+
+                if has_text:
+                    print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
+                    all_found_packages = extract_package_from_page(page)
+                    package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+
+                if package_name:
+                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                    status = "SUCCESS"
+                    message = f"Non-video {ad_type} ad package strictly matched with score {match_score}"
+                    print(f"✅ Row {row_num}: strict matched package -> {package_name} | score={match_score}")
+                else:
+                    package_name = "N/A"
+                    app_link = "N/A"
+                    status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+                    message = f"Non-video {ad_type} ad found, but package score below 0.76. Best score={match_score}"
+                    print(f"⚠️ Row {row_num}: package score below 0.76, writing N/A | best score={match_score}")
+
             data = [
                 advertiser,
-                "N/A",
+                package_name,
                 url,
-                "N/A",
+                app_link,
                 process_time,
-                "N/A",
-                process_time,
+                ad_type,      # Column F: text/image for non-video ads
+                process_time
             ]
+
             safe_update_combined_row(row_num, data)
-            safe_update_headline_desc(row_num, "N/A", "N/A")
+            safe_update_headline_desc(row_num, headline if has_text else "N/A", description if has_text else "N/A")
+
             safe_add_log(
                 row_number=row_num,
-                status="NO_VIDEO_NO_TEXT_IMAGE",
-                log_type="COMBINED",
+                status=status,
+                log_type="NON_VIDEO_AD",
                 url=url,
-                video_id="N/A",
-                app_link="N/A",
-                message="No video ID and no valid text/image creative found",
-            )
-            print(f"⏭ Row {row_num}: no supported creative found")
-
-        except TransientHTTPError as error:
-            status_code = error.status or "NETWORK"
-            retry_status = f"RETRY_{status_code}"
-            print(
-                f"⚠️ Row {row_num}: {error}. Leaving row unprocessed and continuing."
-            )
-            safe_mark_agent_retry(row_num, retry_status)
-            safe_add_log(
-                row_number=row_num,
-                status=retry_status,
-                log_type="TRANSIENT_ERROR",
-                url=url,
-                message=str(error),
+                video_id=ad_type,
+                app_link=app_link,
+                message=message
             )
 
-        except Exception as error:
+            print(f"✅ Row {row_num}: saved NON-VIDEO {ad_type} ad advertiser + package + headline + description")
+
+        except Exception as e:
             error_time = get_exact_time()
-            print(f"❌ Row {row_num} error at {error_time}: {error}")
+            print(f"❌ Row {row_num} error at {error_time}: {e}")
 
-            # Do not write ERROR into column F. Leave it empty so another pass
-            # can retry the row, while the current top/bottom agent continues.
-            safe_mark_agent_retry(row_num, "RETRY_RUNTIME")
-            safe_add_log(
-                row_number=row_num,
-                status="RETRY_RUNTIME",
-                log_type="COMBINED",
-                url=url,
-                message=str(error),
-            )
+            try:
+                data = [
+                    "",
+                    "N/A",
+                    url,
+                    "ERROR",
+                    error_time,
+                    "ERROR",
+                    error_time
+                ]
+
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, "N/A", "N/A")
+            except Exception:
+                pass
+
+            try:
+                safe_add_log(
+                    row_number=row_num,
+                    status="ERROR",
+                    log_type="COMBINED",
+                    url=url,
+                    message=str(e)
+                )
+            except Exception:
+                pass
 
         finally:
-            if page is not None:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-            if context is not None:
-                try:
-                    context.close()
-                except Exception:
-                    pass
-            if browser is not None:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-
+            page.close()
+            context.close()
+            browser.close()
 
 def run_parallel_combined_scraper(max_workers=2):
-    get_url_rows = getattr(sheets, "get_url_rows_with_retry", None)
+    urls = sheets.get_urls_with_retry()
 
-    if get_url_rows:
-        url_rows = get_url_rows(unprocessed_only=True)
-    else:
-        urls = sheets.get_urls_with_retry()
-        url_rows = [
-            (i + 2, u.strip())
-            for i, u in enumerate(urls)
-            if u and u.strip()
-        ]
+    url_rows = [
+        (i + 2, u.strip())
+        for i, u in enumerate(urls)
+        if u and u.strip()
+    ]
 
     if not url_rows:
         print("No transparency URLs found in column H.")
         return
 
-    print(f"🚀 Starting optimized VIDEO + TEXT + FAST IMAGE scraper for {len(url_rows)} rows")
+    print(f"🚀 Starting combined VIDEO + TEXT scraper for {len(url_rows)} rows")
     print(f"⚡ Running parallel with max_workers={max_workers}")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -2599,7 +1592,7 @@ def run_parallel_combined_scraper(max_workers=2):
                 except Exception:
                     pass
 
-    print("✅ Finished optimized video + text + image scraping")
+    print("✅ Finished combined video + text scraping")
 
 
 if __name__ == "__main__":
