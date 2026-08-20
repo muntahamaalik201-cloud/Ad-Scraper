@@ -2824,17 +2824,29 @@ def scrape_single_url(url_row):
             package_name = clean_text(image_ad.get("package_name"))
             app_link = clean_text(image_ad.get("app_link"))
 
-            app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
+            # IMAGE AD APP LINK RESOLUTION
+            # Priority:
+            # 1. Existing extracted app_link from active creative
+            # 2. Visible install button extraction
+            # 3. Package name -> Play Store URL generation
 
-            if app_link == "N/A":
-                app_link = clean_text(image_ad.get("app_link"))
+            existing_image_link = clean_text(image_ad.get("app_link"))
+            if existing_image_link != "N/A":
+                app_link = existing_image_link
+            else:
+                app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
 
-            if app_link == "N/A":
-                package_name = clean_text(image_ad.get("package_name"))
-                if package_name != "N/A":
-                    app_link = (
-                        f"https://play.google.com/store/apps/details?id={package_name}"
-                    )
+            package_name = clean_text(image_ad.get("package_name"))
+
+            # Final fallback: build Play Store link from scoped package
+            if app_link == "N/A" and package_name != "N/A":
+                app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+
+            # Ensure package is always derived from final app link if available
+            if app_link != "N/A":
+                extracted_pkg = extract_package_name(app_link)
+                if extracted_pkg != "N/A":
+                    package_name = extracted_pkg
 
             match_score = image_ad.get("package_score", 0.0)
             has_text = is_valid_text_ad(headline, description)
