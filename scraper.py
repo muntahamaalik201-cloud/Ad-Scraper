@@ -1456,26 +1456,18 @@ def scrape_single_url(url_row):
             # =========================
             print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
-            text_data = wait_and_extract_text_ad_details(
-                page,
-                max_wait_seconds=8
-            )
-
-            headline = clean_text(text_data.get("headline"))
-            description = clean_text(text_data.get("description"))
-
-            has_text = is_valid_text_ad(
-                headline,
-                description
-            )
-
-            is_fast_image = False
-
-            if not has_text:
-                is_fast_image = fast_image_ad_check(page)
+            is_fast_image = fast_image_ad_check(page)
 
             if is_fast_image:
-                print(f"🖼 Row {row_num}: image creative detected")
+                print(f"🖼 Row {row_num}: image creative detected early")
+                headline = "N/A"
+                description = "N/A"
+                has_text = False
+            else:
+                text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=8)
+                headline = clean_text(text_data.get("headline"))
+                description = clean_text(text_data.get("description"))
+                has_text = is_valid_text_ad(headline, description)
 
             process_time = get_exact_time()
 
@@ -1483,7 +1475,10 @@ def scrape_single_url(url_row):
             visible_app_link = (
                 "N/A"
                 if is_fast_image
-                else wait_and_extract_install_link(page, max_wait_seconds=5)
+                else wait_and_extract_install_link(
+                    page,
+                    max_wait_seconds=15
+                )
             )
             visible_package = extract_package_name(visible_app_link)
 
@@ -1538,11 +1533,21 @@ def scrape_single_url(url_row):
                 if has_text:
                     print(f"📦 Row {row_num}: strict text package matching")
                     all_found_packages = extract_package_from_page(page)
+
                     package_name, match_score = get_best_matching_package(
                         headline,
                         description,
                         all_found_packages
                     )
+
+                    # fallback: re-read install link only for text ads if package was not resolved
+                    if not package_name:
+                        fallback_link = extract_install_link_by_precise_js(page)
+                        fallback_package = extract_package_name(fallback_link)
+
+                        if fallback_package != "N/A":
+                            package_name = fallback_package
+                            match_score = 1.0
 
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
