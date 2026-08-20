@@ -1527,7 +1527,7 @@ def scrape_single_url(url_row):
                 package_name = None
                 match_score = 0.0
 
-                if has_text and not is_fast_image:
+                if has_text:
                     print(f"📦 Row {row_num}: strict text package matching")
                     all_found_packages = extract_package_from_page(page)
                     package_name, match_score = get_best_matching_package(
