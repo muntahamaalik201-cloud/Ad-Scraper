@@ -2372,6 +2372,49 @@ def get_active_image_ad_candidate_once(page):
     all_candidates.sort(key=lambda c: c["score"], reverse=True)
     return all_candidates[0]
 
+
+
+def resolve_package_with_fallback(page, headline, description, scoped_packages):
+    """
+    Package discovery v2:
+    1. Use active scoped packages first.
+    2. If missing, collect packages from rendered page/frames.
+    3. Use headline + description package matching fallback.
+    """
+
+    # Existing scoped package logic
+    package_name, score = resolve_package_from_scoped_packages(
+        headline,
+        description,
+        scoped_packages
+    )
+
+    if package_name != "N/A":
+        return package_name, score
+
+    # Broader package discovery
+    try:
+        all_packages = extract_package_from_page(page)
+
+        if all_packages:
+            package_name, score = get_best_matching_package(
+                headline,
+                description,
+                all_packages
+            )
+
+            if package_name:
+                return package_name, score
+
+            # If only one valid package exists, trust it
+            if len(all_packages) == 1:
+                return list(all_packages)[0], 1.0
+
+    except Exception:
+        pass
+
+    return "N/A", 0.0
+
 def resolve_package_from_scoped_packages(headline, description, scoped_packages):
     """
     Resolve package only from active target/ancestor scoped packages.
@@ -2419,7 +2462,8 @@ def wait_and_extract_active_image_ad_data(page, max_wait_seconds=IMAGE_AD_MAX_WA
             # IMPORTANT: image-only ads have NO headline/description in DOM.
             # If image_url exists, return the candidate even when has_text is False.
             if elapsed >= min_wait_seconds and has_image:
-                package_name, package_score = resolve_package_from_scoped_packages(
+                package_name, package_score = resolve_package_with_fallback(
+                    page,
                     candidate.get("headline", "N/A"),
                     candidate.get("description", "N/A"),
                     candidate.get("packages", set())
