@@ -2808,15 +2808,22 @@ def scrape_single_url(url_row):
                 print(f"⏭ Row {row_num}: no active image ad and no image URL found, wrote N/A")
                 return
 
-            image_url = clean_text(image_ad.get("image_url"))
-            headline = clean_text(image_ad.get("headline"))
-            description = clean_text(image_ad.get("description"))
-            package_name = clean_text(image_ad.get("package_name"))
-
             # IMAGE ADS APP LINK EXTRACTION
             # First try the same visible install/app-link logic used by video ads.
             # If Google does not expose a visible install button, fallback to the
             # existing scoped package extraction logic. No other image logic changed.
+            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=20)
+
+            if visible_app_link != "N/A":
+                image_ad["app_link"] = visible_app_link
+                image_ad["package_name"] = extract_package_name(visible_app_link)
+
+            image_url = clean_text(image_ad.get("image_url"))
+            headline = clean_text(image_ad.get("headline"))
+            description = clean_text(image_ad.get("description"))
+            package_name = clean_text(image_ad.get("package_name"))
+            app_link = clean_text(image_ad.get("app_link"))
+
             app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
 
             if app_link == "N/A":
