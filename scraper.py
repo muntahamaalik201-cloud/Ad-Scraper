@@ -2915,6 +2915,9 @@ def scrape_single_url(url_row):
                 message = "Image ad found, but package was not found in active target/parent safeframe scope"
                 print(f"⚠️ Row {row_num}: image data found but package not found in active scope")
 
+            print("DEBUG IMAGE PACKAGE:", package_name)
+            print("DEBUG IMAGE APP LINK:", app_link)
+
             data = [
                 advertiser,
                 package_name,
@@ -2924,6 +2927,8 @@ def scrape_single_url(url_row):
                 ad_type,      # Column F: image for non-video image ads
                 process_time
             ]
+
+            print("DEBUG IMAGE FINAL DATA:", data)
 
             safe_update_combined_row(row_num, data)
             safe_update_headline_desc(row_num, headline, description)
