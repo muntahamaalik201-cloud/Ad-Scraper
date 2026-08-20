@@ -1456,18 +1456,26 @@ def scrape_single_url(url_row):
             # =========================
             print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
-            is_fast_image = fast_image_ad_check(page)
+            text_data = wait_and_extract_text_ad_details(
+                page,
+                max_wait_seconds=8
+            )
+
+            headline = clean_text(text_data.get("headline"))
+            description = clean_text(text_data.get("description"))
+
+            has_text = is_valid_text_ad(
+                headline,
+                description
+            )
+
+            is_fast_image = False
+
+            if not has_text:
+                is_fast_image = fast_image_ad_check(page)
 
             if is_fast_image:
-                print(f"🖼 Row {row_num}: image creative detected early")
-                headline = "N/A"
-                description = "N/A"
-                has_text = False
-            else:
-                text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=8)
-                headline = clean_text(text_data.get("headline"))
-                description = clean_text(text_data.get("description"))
-                has_text = is_valid_text_ad(headline, description)
+                print(f"🖼 Row {row_num}: image creative detected")
 
             process_time = get_exact_time()
 
